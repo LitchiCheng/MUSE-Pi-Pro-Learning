@@ -50,3 +50,9 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+bianbu-linux-2.2/*
+repo
+toolchain.tar.xz
+toolchain/*
+linux-6.6/*

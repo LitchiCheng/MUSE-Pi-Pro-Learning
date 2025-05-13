@@ -1,2 +1,5 @@
 # MUSE-Pi-Pro-Learning
-MUSE-Pi-Pro-Learning
+
+## env-prepare.sh
+
+## build-kernel.sh
