@@ -56,3 +56,4 @@ repo
 toolchain.tar.xz
 toolchain/*
 linux-6.6/*
+output/*

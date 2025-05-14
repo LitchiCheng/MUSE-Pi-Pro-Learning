@@ -38,6 +38,9 @@ installPackages() {
     sudo apt-get install git build-essential cpio unzip rsync file bc wget python3 python-is-python3 libncurses5-dev libssl-dev dosfstools mtools u-boot-tools flex bison python3-pip -y
     sudo pip3 install pyyaml
     sudo apt install repo -y
+    # 用于打包deb
+    sudo apt install debhelper -y 
+    sudo apt install asciidoc -y
 }
 
 if [ "$MAJOR" -gt "20" ]; then
