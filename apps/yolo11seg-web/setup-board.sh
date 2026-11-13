@@ -132,9 +132,11 @@ else
   if [ -f "$MODEL_DIR/yolo11n-seg_opset$OPSET.onnx" ]; then
     ok "已存在 $MODEL"
   elif [ -f "$RAW" ]; then
-    # ultralytics 导出的 yolo11n-seg.onnx 是 opset 22，板上 onnxruntime 1.18 的 schema
-    # 最高只到 17/18，不降级连会话都建不起来。这里只改 opset 版本号：YOLO 图里用到的算子
-    # (Conv/Relu/Add/Mul/Concat/Upsample/Resize/Transpose/Reshape/...) 在 17 与 22 语义一致。
+    # ultralytics 导出的 yolo11n-seg.onnx 是 opset 22，而板上 onnxruntime 1.18.1 的官方
+    # schema 只到 opset 21，不降级连会话都建不起来（报错见 docs/k1-aipu-onnxruntime.md §4）。
+    # 这里只改 opset 版本号：YOLO 图里用到的算子(Conv/Relu/Add/Mul/Concat/Resize/
+    # Transpose/Reshape/Split/Softmax/Sigmoid...) 在 13~22 语义一致，实测 14/15/17/18 结果相同。
+    # 注意：降 opset 与"能不能上智算核"无关，不要指望它提速。
     python3 - "$RAW" "$OPSET" <<'PY' || true
 import os, sys, onnx
 src, ver = sys.argv[1], int(sys.argv[2])
