@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MUSE Pi Pro · YOLO11-seg 实时分割</title>
+<style>
+  :root{--bg:#0e1116;--fg:#e6edf3;--mut:#8b949e;--ac:#3fb950;--ac2:#58a6ff;--line:#21262d}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI","Noto Sans SC",sans-serif}
+  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:600}
+  .sub{color:var(--mut);font-size:12px}
+  main{display:flex;gap:16px;padding:16px;flex-wrap:wrap}
+  .pane{flex:1 1 560px;min-width:320px}
+  .side{flex:0 0 330px}
+  img.stream{width:100%;border:1px solid var(--line);border-radius:8px;background:#000;display:block}
+  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}
+  .card{background:#161b22;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .k{color:var(--mut);font-size:11px;letter-spacing:.3px}
+  .v{font-size:18px;font-variant-numeric:tabular-nums}
+  .v small{font-size:11px;color:var(--mut)}
+  .row{display:flex;align-items:center;gap:8px;margin:8px 0}
+  .row label{flex:0 0 84px;color:var(--mut);font-size:12px}
+  input[type=range]{flex:1}
+  input[type=number]{width:64px;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px}
+  button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;cursor:pointer}
+  button:hover{border-color:var(--ac2)}
+  button.on{background:#1f3d2b;border-color:var(--ac)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:3px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font-weight:500}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .warn{background:#3d2d1f;border:1px solid #9e6a03;border-radius:8px;padding:8px 10px;font-size:12px;margin-top:10px}
+  code{background:#161b22;padding:1px 5px;border-radius:4px;font-size:12px}
+  h2{font-size:13px;color:var(--mut);font-weight:600;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>MUSE Pi Pro · YOLOv11-seg 实时实例分割</h1>
+  <span class="sub">OV5647 (MIPI CSI) → <code>k1cam</code> NV12 → ONNX Runtime → 浏览器</span>
+  <span class="sub" id="prov"></span>
+</header>
+<main>
+  <div class="pane">
+    <img class="stream" id="stream" alt="stream" src="">
+    <div class="cards">
+      <div class="card"><div class="k">推理帧率</div><div class="v" id="ifps">–<small> fps</small></div></div>
+      <div class="card"><div class="k">单帧耗时</div><div class="v" id="ims">–<small> ms</small></div></div>
+      <div class="card"><div class="k">采集 / 显示</div><div class="v" id="cfps">–<small> fps</small></div></div>
+      <div class="card"><div class="k">目标数</div><div class="v" id="nobj">–</div></div>
+    </div>
+    <div class="card" style="margin-top:8px"><div class="k">耗时分解 (预处理 / 网络 / 后处理)</div>
+      <div class="v" id="ms">–</div></div>
+    <div class="warn" id="latnote" style="display:none"></div>
+  </div>
+  <div class="side">
+    <h2>参数</h2>
+    <div class="row"><label>置信度</label><input type="range" id="conf" min="0.05" max="0.9" step="0.05"><span id="confv" style="width:36px"></span></div>
+    <div class="row"><label>NMS IoU</label><input type="range" id="iou" min="0.3" max="0.9" step="0.05"><span id="iouu" style="width:36px"></span></div>
+    <div class="row"><label>mask 透明度</label><input type="range" id="alpha" min="0" max="0.9" step="0.05"><span id="alphav" style="width:36px"></span></div>
+    <div class="row"><label>画面帧率</label><input type="range" id="fps_out" min="2" max="25" step="1"><span id="fps_outv" style="width:36px"></span></div>
+    <div class="row"><label>JPEG 质量</label><input type="range" id="quality" min="40" max="95" step="5"><span id="qualityv" style="width:36px"></span></div>
+    <div class="row"><label>叠加 mask</label><button id="masks">开</button><label style="flex:0 0 60px">HUD</label><button id="hud">开</button></div>
+    <div class="row"><button id="pause">暂停推理</button><button id="shot">保存当前帧</button></div>
+    <h2>检测结果</h2>
+    <table><thead><tr><th></th><th>类别</th><th>分数</th><th>框 (x1,y1,x2,y2)</th></tr></thead><tbody id="rows"></tbody></table>
+    <h2>运行状态</h2>
+    <div class="sub" id="run"></div>
+  </div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const RANGES=["conf","iou","alpha","fps_out","quality"];
+let first=true;
+
+function start(){ $("stream").src="/video?t="+Date.now(); }
+start();
+
+RANGES.forEach(k=>{
+  $(k).addEventListener("change",e=>post({[k]:parseFloat(e.target.value)}));
+  $(k).addEventListener("input",e=>{ $(k+"v") && ($(k+"v").textContent=e.target.value); });
+});
+$("masks").onclick=()=>post({masks: !cur.masks});
+$("hud").onclick=()=>post({hud: !cur.hud});
+$("pause").onclick=()=>post({paused: !cur.paused});
+$("shot").onclick=()=>{ const a=document.createElement("a"); a.href="/snapshot.jpg?t="+Date.now(); a.download="yolo11seg.jpg"; a.click(); };
+
+let cur={};
+async function post(o){ await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)}); tick(); }
+
+async function tick(){
+  try{
+    const s=await (await fetch("/stats?t="+Date.now())).json();
+    cur=s.config;
+    RANGES.forEach(k=>{ if($(k).value!=String(cur[k]) && document.activeElement!==$(k)) $(k).value=cur[k];
+      $(k+"v") && ($(k+"v").textContent=cur[k]); });
+    $("masks").textContent=cur.masks?"开":"关"; $("masks").classList.toggle("on",!!cur.masks);
+    $("hud").textContent=cur.hud?"开":"关";     $("hud").classList.toggle("on",!!cur.hud);
+    $("pause").textContent=cur.paused?"继续推理":"暂停推理"; $("pause").classList.toggle("on",!!cur.paused);
+    $("prov").textContent="EP: "+s.model.providers.map(p=>p.replace("ExecutionProvider","")).join("+")+" · 输入 "+s.model.input.join("x");
+    $("ifps").innerHTML=s.infer.instant_fps.toFixed(2)+"<small> fps</small>";
+    $("ims").innerHTML=s.infer.ms.total.toFixed(0)+"<small> ms</small>";
+    $("cfps").innerHTML=s.cam.fps.toFixed(1)+" / "+s.view_fps.toFixed(1)+"<small> fps</small>";
+    $("nobj").textContent=s.dets.length;
+    $("ms").innerHTML=s.infer.ms.pre.toFixed(0)+" / "+s.infer.ms.infer.toFixed(0)+" / "+s.infer.ms.post.toFixed(0)+" <small>ms</small>";
+      $("rows").innerHTML=s.dets.map(d=>`<tr><td><span class="dot" style="background:rgb(${d.color.join(",")})"></span></td><td>${d.name}</td><td>${d.score.toFixed(2)}</td><td style="color:#8b949e">${d.bbox.join(",")}</td></tr>`).join("")||`<tr><td colspan=4 style="color:#8b949e">无目标</td></tr>`;
+    $("run").innerHTML=`运行 ${s.uptime.toFixed(0)}s · 已推理 ${s.infer.runs} 帧 · 采集 ${s.cam.frames} 帧 · 相机重启 ${s.cam.restarts} 次 · 错误 ${s.cam.errors}`;
+    const n=$("latnote");
+    if(s.infer.instant_fps<3){ n.style.display="block";
+      n.innerHTML="当前分割帧率 "+s.infer.instant_fps.toFixed(2)+" fps：AIPU(SpaceMIT EP) 只接管 int8 量化模型，float32 的 Conv 全部回退到 RISC-V CPU。上方画面流是实时的，分割结果是最近一次推理的叠加。要提速度见 <code>docs/</code> 里的量化说明。"; }
+    else n.style.display="none";
+  }catch(e){ $("run").textContent="stats 获取失败: "+e; }
+}
+setInterval(tick,1000); tick();
+</script>
+</body>
+</html>
