@@ -79,8 +79,9 @@ sleep 8
    换 `linux,cma` 或 flags=0 也可能失败 —— **reboot 后恢复**。所以：采集进程要能被
    SIGTERM/SIGINT 正常收尾（STREAMOFF + REQBUFS(0) + munmap + close），不要动辄 kill -9。
 
-`k1cam.c` 里 `dmabuf_alloc()` 按 `[flags 0xf0 → 0] x [system → linux,cma]` 组合重试，
-并总是以 lseek 的真实大小 mmap；`-v` 会打印每个 plane 的 len/used/data_offset。
+`k1cam.c` 里 `dmabuf_alloc()` 按 `[system → linux,cma]` x `heap_flags=0xf0` 重试最多 16 轮
+（**不拿 flags=0 兜底**：那种 buffer 能建立流但内容为 0，静默出黑帧比直接失败更难查；
+`--hf` 可以手工改这个值做实验），并总是以 lseek 的真实大小 mmap；`-v` 会打印每个 plane 的 len/used/data_offset。
 
 ### 2.3 取帧时每个 plane 的起点是它自己的 `planes[p].data_offset`，不能累加
 
