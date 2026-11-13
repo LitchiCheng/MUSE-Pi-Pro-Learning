@@ -38,11 +38,9 @@ static int xioctl(int fd, unsigned long req, void *arg){
   return r;
 }
 
-/* dma-buf 分配: K1 内核(6.6.63)的 system heap 在 heap_flags=0xf0 时, 返回的 buffer
- * 实际大小可能 *小于* 请求值(实测 req=1MB -> filesz=520192), 直接 mmap 请求长度就会
- *  EINVAL. 官方示例没处理这个, 所以只在 buffer 恰好够大时才正常.
- * 这里循环重试, 仍不够就退回 heap_flags=0(该路径实测给出精确向上取整的大小). */
 static const char *g_heap_paths[2] = { "/dev/dma_heap/system", "/dev/dma_heap/linux,cma" };
+/* heap_flags 表；两个槽位故意同为 0xf0 —— 实测 flags=0 的 buffer 驱动不写入(画面全 0)，
+ * 所以不拿它做兜底。用 --hf 可以整体改成别的值做实验。 */
 static unsigned g_heap_flags_list[2] = { 0xf0, 0xf0 };
 static int g_nb = 4;
 
@@ -56,8 +54,9 @@ static int heap_open(const char *path, int *fd){
  *     可能 *小于* 请求值(实测请求 1MB -> 得到 520192B), 按请求长度 mmap 直接 EINVAL;
  *  2) 同一参数连续调用有时会 EINVAL(与 page-pool / 前一次采集进程残留的引用有关),
  *     需要换 heap / 换 flags 重试。
- * 这里按 [flags 0xf0 -> 0] x [system -> linux,cma] 组合重试, 并且始终以 lseek 拿到的
- * 真实大小去 mmap。 */
+ * 这里按 [system -> linux,cma] x [heap_flags 0xf0] 组合重试(最多 16 轮)，并且始终以
+ * lseek 拿到的真实大小去 mmap。heap_flags=0 试过但不可用：buffer 能 mmap、能 DQBUF，
+ * 驱动却不往里面写，画面全 0。 */
 static int dmabuf_alloc(int fds[2], size_t need, int *fd_out, size_t *real_out){
   /* 只用 heap_flags=0xf0(官方要求): 实测 flags=0 拿到的 buffer 驱动不会写入, 画面全 0 */
   const unsigned *hf = g_heap_flags_list;
