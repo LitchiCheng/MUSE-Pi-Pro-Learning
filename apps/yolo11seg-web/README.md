@@ -17,6 +17,17 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 > 摄像头在暗环境（夜里/无光）下采到的帧 Y 均值 <4，画面近乎全黑，此时 `dets` 为空是正常的，
 > 不是链路坏了。没有光/不想接摄像头时用 `STILL=<图片> ./run-web.sh` 演示分割链路。
 
+## 验证矩阵（哪条结论是在哪儿跑出来的）
+
+| 项 | 在哪验证 | 证据 |
+|---|---|---|
+| `k1cam` 采集 1080p/720p 帧率、NV12 内容 | **板子**（reboot + 单实例 cam-test 后） | 与官方 `v4l2_test_spacemit` 同帧像素统计一致，见 `docs/k1-mipi-camera.md` §3 |
+| float yolo11n-seg CPU 968 ms / EP 1060 ms、检出的 5 个目标 | **板子** | `yolo_seg.py --prefer spacemit`，两后端输出逐目标相同 |
+| `server.py` 全接口（/health /stats /video /snapshot.jpg /config） | 本机(aarch64, ORT 1.32)冒烟 + 板上跑过 | `/stats` 有 5 个目标、`/video` 5 s 出流、`POST /config {"conf":0.5}` 后低分框掉出 |
+| int8 QDQ 模型精度（只量 Conv / 全图+排除 Concat） | **仅 PC**（ORT CPU EP，bus.jpg） | `0.89/0.86/0.85/0.81/0.36` vs float `0.89/0.88/0.85/0.82/0.37` |
+| int8 QDQ 模型能否真的进 AIPU、耗时 | **待板子复验**（板子 2026-11-14 00:49 起断电，`192.168.31.48` 不通） | 用 `SPACEMIT_EP_DUMP_SUBGRAPHS=1` 看有没有 SpineSubgraph 产出 |
+| `setup-board.sh` 全流程 | 分步在板上手工验证过，脚本整体串跑待复验 | 各步命令与板上实测一一对应 |
+
 ## 目录结构
 
 ```
