@@ -85,7 +85,8 @@ PY
 
 1. opset ≤ 21（ORT 1.18.1 的上限；官方 yolo11n-seg 是 22，会加载失败）——
    `apps/yolo11seg-web/export_onnx.py` / `setup-board.sh` 第 4 步自动处理。
-2. 想要智算核加速就得给 int8 QDQ 模型 —— 见 `docs/k1-aipu-onnxruntime.md`。
+2. 想要快就得给**激活为 int8 的量化模型**（`apps/yolo11seg-web/quant/run-quant.sh` 一条命令产出）——
+   判据与账单见 `docs/k1-aipu-onnxruntime.md` §3.4；另注意 K1 上没有独立 NPU，省的是 CPU 工作量（同篇 §8）。
 
 ## 5. 服务化（可选但推荐）
 
@@ -103,7 +104,7 @@ journalctl -u muse-yolo11seg-web -n 50
 | 症状 | 真因 | 去处 |
 |---|---|---|
 | `Opset 22 is under development ... support ... till opset 21` | 官方 ONNX 的 opset 太高 | `docs/k1-aipu-onnxruntime.md` §4 |
-| EP 在 `get_providers()` 里但速度没变 | float Conv 不进 AIPU | 同上 §2 |
+| EP 在 `get_providers()` 里但速度没变 | float Conv 拿不到 int8 kernel（预期行为） | 同上 §2 / §3.4 |
 | 日志 `Attempt to use DefaultLogger but none has been registered` | 没设 `LD_PRELOAD` | 同上 §1.1 |
 | 采到的帧全 0 / 满屏噪声 | cam-test 没起或多开、dma-buf flags | `docs/k1-mipi-camera.md` §2 |
 | `error: externally-managed-environment` | PEP668 | 本文 §2.1 |

@@ -28,4 +28,4 @@ MUSE Pi Pro（SpacemiT K1，RISC-V）上手记录：内核构建脚本 + 一个�
 |---|---|
 | [k1-env-setup.md](docs/k1-env-setup.md) | 开发环境搭建：apt/pip(PEP668)、SSH、zsh 默认 shell、依赖清单 |
 | [k1-mipi-camera.md](docs/k1-mipi-camera.md) | MIPI 相机点亮：cam-test 单实例、dma-buf `heap_flags=0xf0`、plane 偏移、症状对照表 |
-| [k1-aipu-onnxruntime.md](docs/k1-aipu-onnxruntime.md) | ONNXRuntime + 智算核：float 不进 AIPU、int8 QDQ 配方、opset 上限、EP 验证方法、**EP 长跑 SIGSEGV 的实测矩阵与 native 栈** |
+| [k1-aipu-onnxruntime.md](docs/k1-aipu-onnxruntime.md) | ONNXRuntime + SpaceMIT EP：float 不提速、自产 int8 QDQ 配方（**上核开关是激活 `--act int8`**）、opset 上限、EP 验证方法、**K1 上没有独立 NPU 的三条证据**、**EP 长跑 SIGSEGV 的实测矩阵与 native 栈** |

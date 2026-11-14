@@ -3,9 +3,11 @@
 对象：MUSE Pi Pro（SpacemiT K1，riscv64）+ `python3-spacemit-ort` + `onnxruntime 1.18.1`。
 模型：ultralytics 官方 `yolo11n-seg.onnx`（float）及其 int8 QDQ 变体。
 
-TL;DR：**float 模型在 K1 上永远跑 CPU，智算核只吃官方工具链产出的 int8 图。**
-把 640x640 的 float yolo11n-seg 降到低 opset、开 EP、加线程，全都无效；
-换成量化模型才能进 AIPU（实测 yolov8n-seg 量化版 sess.run 155 ms，端到端 408 ms/帧）。
+TL;DR：**float 模型在 K1 上永远跑 CPU；能不能落到 SpaceMIT EP 的 int8 kernel，只看激活张量
+是不是 `tensor(int8)`**（§3.4 修正版；早先写的"只吃官方工具链产出的图"是被 ORT 默认的
+`QUInt8` 激活误导出来的错结论）。把 640x640 的 float yolo11n-seg 降到低 opset、开 EP、加线程，
+全都无效；换成 int8 激活的量化图才快：自产 `--act int8` 421 ms/帧、官方 yolov8n-seg.q.onnx
+214 ms/帧（同一份 float 是 1162 ms）。
 
 但 libspacemit_ep 1.2.2 跑 int8 会在连续推理时随机 SIGSEGV，Python 侧完全抓不到（第 7 节）。
 **崩不崩和线程数配置强相关**：`SPACEMIT_EP_INTRA_THREAD_NUM=4` 且把 ORT 的
@@ -13,7 +15,7 @@ TL;DR：**float 模型在 K1 上永远跑 CPU，智算核只吃官方工具链�
 **32 min / 4559 次推理 0 崩**（§7.1）；老配置（EP 4 线程 + ORT 8 线程）是 **5 min 崩 6 次**。
 代码已按这条自动收线程（`yolo_seg._tie_intra()`）。即便如此板端默认仍是
 "float yolo11n-seg + CPU + 0.6 fps"——int8 那份是 v8 不是 v11，而且长跑样本只有一块板一次，
-要 2.4 fps 就照 §7 末尾显式换模型并挂上看门狗。
+要快就显式换量化模型并挂上看门狗：自产 int8 yolo11（§3.4，1.1 fps）或官方 int8 v8（§7.1，2.4 fps）。
 
 ---
 
@@ -139,9 +141,13 @@ cd ~/work/yolo11seg-web && ./epcheck/run-epcheck.sh
 > 代码里判"是不是 int8 模型"（只为决定线程池）因此找的是 `QuantizeLinear` 子串，
 > 见 `web/yolo_seg.py` 的 `QUANT_OP_TAGS`。
 
-一句话结论：**K1 的 EP 只认官方工具链（PPQ / ai_toolkit）产出的 int8 形态**，包括自研的
-融合算子（`QLinearSwish` 这种）和配套的 Transpose 布局处理。自己用 onnxruntime 量化器产的
-QDQ/QLinearConv 图，无论怎么写都留在 CPU 上。
+一句话结论（2026-11-14 上午版，**本轮已被部分推翻，见 §3.4**）：K1 的 EP 只认官方工具链
+（PPQ / xquant）产出的 int8 形态。自己用 onnxruntime 量化器产的 QDQ/QLinearConv 图全留在 CPU 上。
+
+> 这个结论当时对所有测过的模型都成立，所以看起来像"格式派"问题。真正的开关其实是**激活的
+> 数据类型**：我们的量化脚本用了 ORT 默认的 `activation_type=QUInt8`，而这个 EP 的 int8
+> kernel 只注册了 `tensor(int8)` 的激活。换成 `QInt8` 以后，**同一套 onnxruntime 量化器、
+> 同一张图**，100 个卷积里 99 个直接落到 SpaceMIT EP（§3.4 有账单）。跟"必须用官方工具"无关。
 
 ## 3. 要进 AIPU：整图 int8 QDQ
 
@@ -162,9 +168,13 @@ QLinearConv 建不出来 / 建出来也在 CPU：
 create_operator 'SpaceMITExecutionProvider_QLinearConv_72'(QLinearConv_qc8) returned 4   # 官方 yolo11n.q.onnx 也这样
 ```
 
-也就是说决定成败的不是"QDQ 还是 QLinearConv"，而是**这张图是不是官方工具链按它认识的
-pattern 产出的**。这一点在本轮用 `--format qoperator` 把 QDQ 全图改写成 100 个
-QLinearConv 之后被反证：算子类型对了，Placement 仍然全是 CPU。
+也就是说决定成败的**不是**"QDQ 还是 QLinearConv"这种表面形态 —— 用
+`--format qoperator` 把 QDQ 全图改写成 100 个 QLinearConv，Placement 仍然全是 CPU。
+
+> 当时从这一行往下推的结论是"那就是官方工具链的 proprietary pattern 了"，**这个推断错了**：
+> 两组实验的激活都是 ORT 默认的 `uint8`，共同变量找错了。真正的开关见 §3.4
+> （`--act int8`，同一套 onnxruntime 量化器就能让 99/101 个卷积落 EP）。
+> 形态实验本身仍然有效：它排除了"改个算子名字就能上核"这条路。
 
 参考数据（同一块板、640x640）：`resnet18.q.onnx` 19 ms、`yolov8n-seg.q.onnx` 204 ms，
 说明格式对了提速是实打实的。官方 modelzoo 给的口径：resnet18 int8 12.99 ms、
@@ -192,6 +202,88 @@ python3 quant_qdq.py yolo11n-seg_opset17.onnx yolo11n-seg_qdq_conv.onnx --images
 
 结论：优先"只量 Conv"，需要更高覆盖率时**必须把输出侧那个跨值域的 Concat 排除掉**。
 量化模型上板前先在 PC 上跑一遍 `web/yolo_seg.py --image bus.jpg` 对精度，别直接上摄像头。
+
+### 3.4 真正的开关：激活必须是 **INT8**，不是 ORT 默认的 UINT8（自产模型上核实测）
+
+EP 二进制里把收图规矩写得很直白（`libspacemit_ep.so.1.2.2`，`strings` 可查）：
+
+```
+' in SpaceMIT EP, we have FLOAT|INT8, but got          ← 类型判据只有 FLOAT 和 INT8
+per-channel uint8 quantization isn't supported
+of scale quantization parameters for UINT8 tensor
+only support 0 as zero point for per-channel quantization
+N11onnxruntime21QDQ14NodeGroupSelectorE / SpaceMITQuantizeNodeCapability
+```
+
+也就是说 `QDQNodeGroupSelector` 在 capability 判定阶段按**张量元素类型**筛卷积：激活写成
+`tensor(uint8)` 直接不合格 → 该 Conv 不进 EP → 图优化阶段 CPU EP 把 Q/DQ 折成
+`QLinearConv_token_*` 自己吃掉（于是 Placement 里看到"100 个 QLinearConv 全在 CPU"）。
+`quant/quant_qdq.py` 之前用的正是 ORT 的默认 `QuantType.QUInt8`；现在加了 `--act {uint8,int8}`。
+
+同一份 `yolo11n-seg_opset17.onnx`，只差这一个参数，板上的账单（`./epcheck/run-epcheck.sh`，
+2026-11-14 19:0x）：
+
+| 模型 | SpaceMIT EP 拿到的算子 | Conv 类落点 | 干净单帧 | bus.jpg 分数 |
+|---|---|---|---|---|
+| float（参照） | Mul×88, Sigmoid×87, Add×13, Sub×2, Div×1（191 个，无卷积） | **CPU 101 / EP 0** | 1162 ms | 0.89/0.88/0.85/0.82/0.37 |
+| 自产 QDQ `--act uint8` | Mul×88, Sigmoid×87, Add×15（193 个，无卷积） | **CPU 101 / EP 0** | — | 0.87/0.86/0.83/0.79/0.38 |
+| **自产 QDQ `--act int8`** | **QLinearConv×99**, DequantizeLinear×218, QuantizeLinear×88, Mul×88, Sigmoid×87（598 个） | **CPU 2 / EP 99** | **421 ms** | 0.89/0.86/0.83/0.81/0.38 |
+| 官方 int8 `yolov8n-seg.q.onnx`（参照） | QLinearConv×75, QLinearSwish×66, MaxPool×3（164 个） | CPU 1 / EP 75 | 214 ms | 0.87/0.87/0.85/0.82 |
+
+- 上表的"干净单帧"是**停掉 web 后**用 `sess.run` 计时的 `wall`（8 次均值，随机噪声输入）；
+  和 web 并存时同一发会是 1245~1547 ms，别看串了。
+- 精度：**int8 自产量化相对 float 最大掉 0.03、平均掉 0.01**（0.89/0.86/0.83/0.81/0.38 vs
+  0.89/0.88/0.85/0.82/0.37），可以直接用。
+- 留在 CPU 的那 2 个卷积类算子是 1 个 `ConvTranspose`（neck 的 upsample 分支，EP 的
+  ConvTranspose 只收 float/float16）和 1 个被 `nodes_to_exclude` 保精度而排除的 Conv。
+
+一条命令复现（PC 侧，任意架构，不需要 torch）：
+
+```bash
+python3 quant/quant_qdq.py models/yolo11n-seg_opset17.onnx out/y11seg_int8.onnx \
+    --images "corpus/*.jpg" --n 36 --ops Conv --exclude /model.23/Concat_6 \
+    --format qdq --act int8
+```
+
+参数里三个都是必要的，少一个就退化成上表的 uint8 行：`--act int8`（激活有符号）、
+`--ops Conv`（只量卷积，逐元素算子留给 EP 的 float kernel，精度最稳）、
+`--exclude /model.23/Concat_6`（§3.3 那条坑）。
+
+校准集：本轮用的是 **9 张这块板上摄像头拍的实拍图**（`--images corpus/*.jpg`）。
+`load_corpus()` 会把每张图做 9 个平移块（±160 像素的 roll）再 letterbox 到 640，
+所以实际喂进校准器的是 81 条样本 —— `--n 36` 是**下限**而不是上限（真实块多于 36 就全用），
+只有真实图不够时才会拿随机噪声/高斯模糊图补位。换别的场景部署时，把这批图换成你实际会遇到的画面，
+比调任何参数都重要。
+
+### 3.5 官方的量化工具是 xquant（不是 PPQ 裸用）
+
+官方文档 `software/SDK/ros/k1/07_Advanced_development/7.1_Model_Quantization.md`
+（版本 2025-09-22）给的正规路子：
+
+```bash
+pip install xquant --index-url https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple
+python3 -m xquant --config yolov8/data/yolov8_xquant_config.json     # 产出 yolov8n.q.onnx + .q_report.md
+```
+
+`xquant` 是 SpacemiT 基于 **PPQ v0.6.6+** 做的封装（最新 2.0.4，`py3-none-any` 纯 Python 包，
+依赖 torch/torchvision）。官方另一篇 `4.4 YOLOv8 训练部署全流程` 明确写了
+**「量化操作需在 x86 平台进行」**，且要求用 `truncate_var_names` 在后处理节点前截断 ——
+和 §3.3 那条"别量化输出 Concat"是同一件事的两种说法。
+
+把 wheel 拆开能直接看到它对"什么形态能上核"的官方答案（`xquant/optimizer/refine.py`）：
+
+```python
+class AsymmetricaUnsignlAlignSign(QuantizationOptimizationPass):   # "XQuant AsymmetricalAlignS8 Pass"
+    if config.policy.has_property(ASYMMETRICAL) and config.quant_min == 0:
+        config.quant_min = -(2 ** (num_of_bits - 1)); config.quant_max = 2 ** (num_of_bits - 1) - 1
+        config.offset = config.offset + config.quant_min
+```
+
+即 **xquant 专门有一个 pass 把"无符号非对称"的激活改成"有符号 int8"**，
+`XQuantizer` 的 `target_platform` 也写死 `TargetPlatform.XQUANT_INT8`、
+Conv 用 `SYMMETRICAL + PER_CHANNEL`。这从上游工具的角度反向坐实了 §3.4 的判据：
+官方 int8 模型里 251 个 QuantizeLinear 的 zero_point **全是 INT8**（本轮用
+`quant/onnxlite.py` 直接解析 protobuf 数出来的），而不是 ORT 量化器默认给的那套 uint8。
 
 ## 4. opset：只是"能不能打开"，和加速无关
 
@@ -245,15 +337,31 @@ FAIL: Load model ... ValidateOpsetForDomain ... ONNX Runtime only *guarantees* s
 
 ## 6. 抓官方文档正文的技巧
 
-`spacemit.com/community/document/...` 页面是前端渲染的，抓不到正文。正文其实是静态 md：
+`spacemit.com/community/document/info?nodepath=...` 这个 URL 现在**只会返回 1223 字节的 Vue
+壳子**（`GET` 任何 `?lang=zh&nodepath=*.md` 变体都是同一份 HTML，200 + text/html）。
+正文不在页面里，走的是"文档树 API + CDN 静态 md"两步（本轮从 `assets/js/index-*.js` 里挖出来的）：
 
-```
-https://cdn-resource.spacemit.com/ai/compute_stack/ai_compute_stack/onnxruntime.md
-https://cdn-resource.spacemit.com/ai/compute_stack/ai_compute_stack/onnxruntime_ep_ops.md
-https://cdn-resource.spacemit.com/ai/compute_stack/ai_compute_stack/model_zoo.md
+```bash
+# 1) 全量文档树：每个叶子带 namePath / path / url(GitHub) / storgeAddress(CDN)
+curl -s "https://www.spacemit.com/api-server/document/get-doc-tree?language=zh" -o tree.json
+#    注意 base 必须是 /api-server，直接拼 /api 或 /document 会回那个 HTML 壳
+
+# 2) 用树里的 storgeAddress 取正文（path 里有中文，要 percent-encode）
+curl -sL "$(python3 -c "import json;d=json.load(open('tree.json'));..." )"
 ```
 
-把 nodepath 的最后一段换成文件名即可；不存在时返回 OSS 的 `NoSuchKey` XML（用这个判断路径写错）。
+`grep` 树里的 `path` 找文档比翻导航快得多。本轮定位到的几篇（`tree.json` 里的字段值）：
+
+| 正文 | storgeAddress 去掉域名的前缀 |
+|---|---|
+| ONNXRuntime EP 加速算子（**每个算子的 capability 限制，含 QDQ**） | `/ai/docs-ai/zh/compute_stack/ai_compute_stack/onnxruntime_ep_ops.md` |
+| SpacemiT-ONNXRuntime（**全部 ProviderOption 的官方说明**） | `/ai/docs-ai/zh/compute_stack/ai_compute_stack/onnxruntime.md` |
+| K1 模型量化开发（xquant） | `/software/SDK/ros/docs-ros/zh/k1/07_Advanced_development/7.1_Model_Quantization.md` |
+| K1 YOLOv8 训练部署全流程 | `/software/SDK/ros/docs-ros/zh/k1/04_Model_deployment/4.4_Training_and_Deployment_Pipeline.md` |
+
+`url` 字段那侧是 `github.com/spacemit-com/docs-ai|docs-ros|docs-courses|docs-events`，
+`raw.githubusercontent.com/...` 也能拿到（本轮实测 `docs-ai` 的 FAQ 200、其余仓库的同名文件 404，
+仓库名和目录层级和 `path` 不完全对得上，所以**优先用 `storgeAddress`**）。
 
 ---
 
@@ -360,3 +468,56 @@ Thread 15 "python3" received signal SIGSEGV, Segmentation fault.
 > 顺带一个坑：`import onnxruntime` 必须在 `import spacemit_ort` **之前**。反序时 float 模型
 > 一切正常，但 int8(QLinearConv) 模型会让 EP 打 `Attempt to use DefaultLogger but none has
 > been registered` 然后**静默回退 CPU**，耗时从 163 ms 变成 ~1371 ms 且没有任何报错提示。
+
+---
+
+## 8. 先校准用词：K1 上没有独立 NPU，"上核"= 上 SpacemiT 优化的 int8 CPU kernel
+
+`docs/k1-env-setup.md` 和本篇前面都顺着官方宣传写了"智算核 / AIPU / NPU"。板子上查完硬件，
+**这块板上并不存在一个独立的神经网络加速单元**，三条互相独立的证据：
+
+1. **设备树里没有 NPU 节点**。`/proc/device-tree/` 全量遍历，和算力沾边的只有
+   `tcm@0xd8000000`（TCM，片上紧耦合内存，驱动 `d8000000.tcm`）、`pdma@d4000000`、
+   `adma@C0883800`；`find /proc/device-tree -name compatible | xargs grep -l npu\|aipu`
+   是**空**，`dmesg | grep -iE 'aipu|npu'` 也是空。`lscpu`：8× `SpacemiT(R) X60`，
+   614.4~1600 MHz，没有第二个计算簇。
+2. **`/dev/udma`、`/dev/tcm` 被打开不等于被计算**。`libspacemit_ep.so.1.2.2` 里确实写着
+   `/dev/udma`、`/dev/tcm`、`tcm_malloc`，`strace` 也看到会话建起来时
+   `openat("/dev/tcm", O_RDWR|O_SYNC) = 5` / `openat("/dev/udma", ...) = 6`；
+   但整发推理里这两个 fd 上**一个设备 ioctl 都没有**（只有 184 条 ioctl，全是 `TCGETS`/
+   `TIOCGWINSZ` 这类 isatty 探测）。而且 `fuser /dev/udma` 显示采集进程 `k1cam` 也持有它 ——
+   它是 SoC 通用 DMA 引擎，不是 NPU 的门。
+3. **线程数扫描证明计算在 CPU 核上**。同一份 int8 模型（§3.4 的 `--act int8` 产物）单实例、
+   只改 `EP_THREADS`：
+
+   | `EP_THREADS` | `sess.run` wall | 进程 CPU 时间（`getrusage`） | CPU/wall |
+   |---|---|---|---|
+   | 1 | 621 ms | 620 ms | **1.00** |
+   | 2 | 606 ms | 1211 ms | **2.00** |
+   | 4 | 416 ms | 1655 ms | **3.97** |
+   | 8 | 1143 ms | 4525 ms | 3.96（过订阅，反而慢） |
+
+   **CPU 时间恰好 = wall × 线程数**，即每颗核都被这段计算实打实占满；真要有硬件核在算，
+   CPU 时间应该远低于 wall。float 模型同测是 1162 ms wall / 8395 ms CPU（7.22 核）。
+
+所以正确的说法是：**int8 的收益来自"每帧要做的 CPU 工作量变小"**。按 CPU 时间算最干净 ——
+float 8395 ms/帧 vs int8(4 线程) 1655 ms/帧，**量化把单位帧的计算量砍到 1/5.1**；
+单核口径更明显：int8 单核 620 ms 就能跑完一帧，float 摊到 8 核反而要 1049 ms/核。
+这正是 SpacemiT 官方对 K1 的定名 —— 竞赛赛题那篇就叫
+**《基于 K1 **AI CPU** 大模型部署落地》**，正文写的是"增加了对进迭时空 **AI 扩展指令**的支持"，
+全程不出现 NPU/AIPU 字样。
+
+> 结论到文档里的落点：以后看到"EP 75 个 QLinearConv 在核上"这类描述，按本节理解为
+> "在 SpaceMIT EP 的 int8 CPU kernel 上（跑在 X60 核 + 向量/AI 扩展指令，4 线程）"。
+> `epcheck` 的判据本身不变 —— 它回答的是"这些算子有没有交给 SpacemiT 的优化 kernel"，
+> 这仍然是决定快慢的关键。
+
+## 附：本轮（2026-11-14）改动清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `apps/yolo11seg-web/quant/quant_qdq.py` | 加 `--act {uint8,int8}`（默认 uint8 保持向后兼容），文件头写清"想吃 EP 必须 int8" |
+| `apps/yolo11seg-web/quant/onnxlite.py` | 新增：不依赖 onnx/torch 的 protobuf 级模型结构速览（`§2.3` 那些数字就是它数出来的） |
+| `apps/yolo11seg-web/quant/run-quant.sh` | 新增：PC 侧一条命令出 int8 模型 + 上板 epcheck 的提示 |
+| `apps/yolo11seg-web/epcheck/` | 新增（上一轮）：一条命令出"卷积落在哪个 EP"的账单 |
+
