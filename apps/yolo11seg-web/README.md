@@ -9,14 +9,15 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 | 项目 | 结果 |
 |---|---|
 | 采集（1280x720 NV12） | web 侧 `cam.fps` 稳定 **15.3~15.4**，72s 无重启无黑帧；`cam-start.sh` 校验 371 帧/24s（13.7 fps，差值是校验脚本自己逐帧做 numpy 统计） |
-| 推理（float yolo11n-seg @640） | 单帧 968 ms（纯推理基准）/ 1233 ms（web 里和采集线程抢核时），**≈0.65~1.0 fps** |
+| 推理（float yolo11n-seg @640，**当前默认**） | 单帧 968 ms（纯推理基准）/ 1400~1570 ms（web 里和采集线程抢核时），**≈0.58~0.65 fps** |
 | 推理走 SpaceMIT EP（智算核） | **float 模型不加速**：Placement 日志显示 97 个 Conv 全在 CPU（判据与矩阵见 `docs/k1-aipu-onnxruntime.md` §1.2/§2.1） |
-| 官方 int8 `yolov8n-seg.q.onnx` | **EP 163 ms vs CPU 1371 ms（8.4x）**，是唯一真正能实时的形态；但它是 13 输出（按层拆开的 DFL 输入），本仓库解码器还不支持 → 待办 |
+| 官方 int8 `yolov8n-seg.q.onnx`（v8，13 输出） | **单帧 408 ms（EP）vs 1371 ms（CPU）**、`bus.jpg` 精度对得上（bus 0.87 / person 0.87/0.85/0.82），解码器已支持。崩不崩几乎由线程数决定：`EP_THREADS=4` 且 ORT 线程池也收到 4 → **32 min / 4559 次 0 崩（2.43 fps）**；线程池留在 8（旧默认）→ **5 min 崩 6 次**。`_tie_intra()` 已自动配平，但样本是一块板一次长跑，常驻仍建议配看门狗 |
 | 自产 int8（QDQ / 改写成 QLinearConv） | 3067~3176 ms，**比 float 更慢**：QLinearConv 仍落 CPU |
 | 画面出流（MJPEG 1280x720 q80） | 约 6 帧/s，瓶颈是 K1 上的 JPEG 编码；`/video` 3s 实测 19 帧 |
 | 结果正确性 | `bus.jpg` 上 CPU 与 EP 输出完全一致：bus 0.89 / person 0.88 / 0.85 / 0.82 / 0.37（板上 `/stats` 复核过） |
+| 崩溃自愈 | `supervise-web.sh` 看门狗：web 进程消失（含 SIGSEGV）2s 后重开，实测 **32s 崩 → 2s 恢复**，`/stats` 重新出数 |
 
-所以现在的"实时"是这样的：**浏览器看到的画面 15 fps，mask 大约每 1.5s 更新一次**
+所以现在的"实时"是这样的（默认 float 模型）：**浏览器看到的画面 15 fps，mask 大约每 1.6s 更新一次**
 （HUD 上 `infer ... fps` 是真实分割帧率，`view ... fps` 是画面帧率，不假装实时）。
 `--still` 模式实测 infer 0.86 fps（970 ms/帧）、5 个目标全部正确，说明低的是算力不是链路。
 
@@ -44,6 +45,10 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 | `server.py` 全接口（/health /stats /video /snapshot.jpg /config） | 本机(aarch64, ORT 1.32)冒烟 + 板上跑过 | `/stats` 有 5 个目标、`/video` 5 s 出流、`POST /config {"conf":0.5}` 后低分框掉出 |
 | int8 QDQ 模型精度（只量 Conv / 全图+排除 Concat） | **仅 PC**（ORT CPU EP，bus.jpg） | `0.89/0.86/0.85/0.81/0.36` vs float `0.89/0.88/0.85/0.82/0.37` |
 | int8 各形态能否进 AIPU、耗时 | **板子** 2026-11-14 08:4x | Placement 直方图 + 端到端耗时，6 个模型矩阵见 `docs/k1-aipu-onnxruntime.md` §2.1（`SPACEMIT_EP_DUMP_SUBGRAPHS` 这条判据被证伪，别再用） |
+| 官方 int8 13 输出解码正确性 | **板子** | bus.jpg：bus 0.87 + person 0.87/0.85/0.82；单帧 infer 418 ms（float 1371 ms） |
+| EP 崩溃矩阵（线程数 x 内容 x 第几次崩） | **板子** 2026-11-14 09:5x~11:3x | `docs/k1-aipu-onnxruntime.md` §7（8 线程 4 轮都崩在 i=74~76；web 并发下 32s 崩） |
+| 看门狗自愈 | **板子** 11:36 | q 模型崩后 `logs/web-supervise.log`: `web 退出（存活 32s，累计第 1 次）` → 2s 后第 2 次启动、`/stats` 恢复出数 |
+| `import onnxruntime` 与 `spacemit_ort` 的顺序 | **板子** 10:4x | 反序 + int8 → EP 报 DefaultLogger 未注册并回退 CPU（`/stats` 的耗时 x10） |
 | `setup-board.sh` 全流程 | 分步在板上手工验证过，脚本整体串跑待复验 | 各步命令与板上实测一一对应 |
 
 ## 目录结构
@@ -53,6 +58,7 @@ apps/yolo11seg-web/
 ├── setup-board.sh      # 板端一键：apt 依赖 → 编 k1cam → 配相机 → 下模型/降 opset → 单帧自检
 ├── cam-start.sh        # 点亮相机：清理多余 cam-test + 用像素统计校验"真的出图了"（不再需要常驻服务）
 ├── run-web.sh          # 启动 web（处理 LD_PRELOAD，参数用环境变量覆盖）
+├── supervise-web.sh    # 看门狗：web 退出/卡死就重开（量化模型走 EP 必崩时靠它兜底）
 ├── export_onnx.py      # PC 端：下载官方 yolo11n-seg.onnx 并降到板端能加载的 opset
 ├── cam/k1cam.c         # V4L2(m2m)+dma-buf 采集器，往 stdout 吐 NV12 裸帧
 ├── web/server.py       # Flask 后端：采集线程 + 推理线程(跳帧不排队) + MJPEG
@@ -108,9 +114,13 @@ ROTATE=180 ./run-web.sh    # OV5647 模组装反（画面上下颠倒）时加 R
 ## 可调参数
 
 `run-web.sh` 的环境变量：`PORT` `MODEL` `CONF` `WIDTH`(+`HEIGHT`) `PREFER`(auto|spacemit|cpu)
-`STILL`(静态图) `VIDEO`(mp4) `ROTATE`(0/90/180/270)。等价的 `server.py` 参数见 `--help`
+`STILL`(静态图) `VIDEO`(mp4) `ROTATE`(0/90/180/270) `EP_THREADS`(SpaceMIT EP 线程数，默认 4)。
+等价的 `server.py` 参数见 `--help`
 （另有 `--cam --dev --cam-log --iou --mask-mode --quality --host --full-range`）。
 采集端 ioctl 等 cam-test 注册格式的超时用 `K1CAM_WAIT`（秒，默认 20）。
+
+`supervise-web.sh` 另有 `LOG`（默认 `logs/web-supervise.log`）与 `STALL_KILL`（秒，默认 120；
+进程活着但 `infer.runs` 不再增长就主动杀掉重开，0=关）。
 
 > 板上 `/tmp` 是 tmpfs，**重启就空**：`STILL=/tmp/bus.jpg` 重启后会报
 > `can't open/read file`（实测踩过）。测试图放 `~/work/pics/` 这种持久目录。
@@ -124,26 +134,47 @@ ROTATE=180 ./run-web.sh    # OV5647 模组装反（画面上下颠倒）时加 R
 | 帧一直在走但画面纯黑、`/stats` 里 `cam.lum≈0.5` | `ps -eo pid,ppid,etime,comm \| grep cam-test` | 有多发 cam-test 抢 pipeline。设备空闲时清到只剩 1 发；**正在推流时绝对不要 `pkill cam-test`**（会把采集端钉成 D 状态，只能重启板子） |
 | 采集进程 `kill -9` 杀不掉、状态 D | `ps -eo pid,stat,comm \| grep k1cam` | 先 `sudo setsid nohup /usr/bin/cam-test /root/svivi_cam1.json &` 恢复出帧再杀；不行就 reboot |
 | 画面上下颠倒 | 模组装反，subdev 无翻转控件 | `ROTATE=180 ./run-web.sh` |
-| 推理只有 1 fps 左右 | `/stats` 的 `model.providers` + `docs/k1-aipu-onnxruntime.md` | float 模型不吃 AIPU 是预期行为，别在量化上继续折腾；要实时看 §"想上智算核" |
+| 推理只有 1 fps 左右 | `/stats` 的 `model.providers` + `docs/k1-aipu-onnxruntime.md` | float 模型不吃 AIPU 是预期行为；要提速只能官方 int8，但它对线程数配置很敏感，看 §"想上智算核" |
+| web 跑着跑着整个进程消失、`/stats` 变 HTTP=000、日志里没有 traceback | `dmesg` 也没有 segfault 记录，`logs/web-supervise.log` 会记"存活 Ns" | 是 SpaceMIT EP 在 int8 模型上 SIGSEGV（Python 层抓不到）。用 `supervise-web.sh` 兜底，或换回 float 模型 |
+| `/stats` 里 `infer.fps` 远低于 `1/ms.total` | `ms.wait`（等采集帧的毫秒数）与 `cam.fps` | wait 大 → 卡在采集侧（`docs/k1-mipi-camera.md`）；wait≈0 但 fps 低 → 卡在推理线程自身的调度 |
 
-## 想上智算核（把 1 fps 变成 6 fps）
+## 想上智算核（0.6 fps → 2.4 fps，长跑要靠线程数配平）
 
 板上实测过 6 个模型（`docs/k1-aipu-onnxruntime.md` §2.1），结论很硬：
 **只有官方工具链（PPQ / ai_toolkit）产出的 int8 图才会真正落到 AIPU**；
 自己用 onnxruntime 量化器产的 QDQ（哪怕 `--format qoperator` 改写成 100 个 QLinearConv）
-全部留在 CPU，还比 float 慢 2~3 倍。所以下面这条路只对"用官方工具重量化"有效：
+全部留在 CPU，还比 float 慢 2~3 倍。所以这条路只对"用官方工具重量化"有效：
 
 ```bash
-# 官方 int8 模型形态可直接验证收益（v8 seg，163 ms/帧）
-MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit ./run-web.sh
-#   -> 目前会 raise "需要 ultralytics seg 导出(1 输入 2 输出)"：它是 13 输出（按层拆开）
-#      要补一个多尺度 DFL 解码器（web/yolo_seg.py），这是本项目下一步的主要工作
+# 官方 int8 yolov8n-seg.q.onnx：解码器已支持（13 输出 / DFL，见 yolo_seg.py 的 _classify_outputs）
+MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit ./supervise-web.sh            # 单帧 ~408ms
 ```
+
+启动日志里必须出现这一行，否则线程没配平、几十秒就会崩：
+
+```
+[info] intra_op_num_threads=4 (ep=True quant=True ep_threads=4)
+```
+
+- 精度核对（板上 bus.jpg）：bus 0.87 / person 0.87 / 0.85 / 0.82，与 float 的
+  0.89/0.88/0.85/0.82 同级，int8 量化噪声最大 0.06。
+- **代价：崩溃由线程数配平决定**。`SPACEMIT_EP_INTRA_THREAD_NUM` 设 6/8 时"跑到第 75 次
+  推理"必 SIGSEGV；设 4 而 ORT 线程池留在 8 时 web 里 20~94s 崩一次（5 min 6 次）；
+  **两者都取 4 → 32 min / 4559 次 0 崩**。崩溃发生在 `sess.run` 内部，没有 Python 异常、
+  RSS 不涨（不是泄漏），native 栈落在 `libspacemit_ep.so.1.2.2` + ORT
+  `ThreadPoolTempl::WorkerLoop`（`docs/k1-aipu-onnxruntime.md` §7.1）。
+  **结论：要速度就用 int8（+看门狗），但它不是 yolo11 且没证明根治，默认仍是 float yolo11。**
+- 想让它"崩了也能继续演示"就挂看门狗：
+  `MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit ./supervise-web.sh`（`EP_THREADS` 保持默认 4，
+  别改成 6/8：那一档实测崩溃率反而更高，见 docs §7.1）。
+- 为什么 import 顺序是 `onnxruntime` 先、`spacemit_ort` 后：反序时 int8 模型会让 EP 报
+  `Attempt to use DefaultLogger but none has been registered` 然后**静默回退 CPU**
+  （比 float 还慢 10 倍）。`make_session()` 里已按正确顺序写死，别调换。
 
 自产 QDQ 的两种配方（只量 Conv / 全图 QDQ）区别和坑写在 `quant/quant_qdq.py` 文件头，
 精度在 PC 上验过（`0.89/0.88/0.85/0.79/0.36` vs float `0.89/0.88/0.85/0.82/0.37`），
-但**别指望它提速**。量化模型上板前务必先跑
-`python3 web/yolo_seg.py --model <量化模型> --image bus.jpg` 对精度，再上摄像头。
+但**别指望它提速**。任何量化模型上摄像头前务必先跑
+`python3 web/yolo_seg.py --model <量化模型> --image ~/work/pics/bus.jpg` 对精度。
 
 ## 遇到问题先看这三篇
 

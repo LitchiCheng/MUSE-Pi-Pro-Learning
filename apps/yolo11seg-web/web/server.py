@@ -355,7 +355,9 @@ class Engine:
             if self.cfg.snapshot()["paused"]:
                 time.sleep(0.2)
                 continue
+            t_wait = time.time()
             frame, seq = self.src.latest(timeout=1.0, after=last)
+            wait_ms = (time.time() - t_wait) * 1000.0
             last = seq if seq > last else last
             if frame is None:
                 continue
@@ -369,6 +371,9 @@ class Engine:
                 continue
             with self._lock:
                 self.dets, self.dets_seq, self.ms, self.n = dets, seq, dict(self.model.ms), self.n + 1
+                # wait = 等"比上一帧新"的采集帧花了多久。total+wait ≈ 1/fps 说明瓶颈在采集/调度侧，
+                # 不是推理本身（量化模型上就出现过 total 419ms 但实际只有 0.21 次/秒的情况）。
+                self.ms["wait"] = wait_ms
 
     def result(self):
         with self._lock:

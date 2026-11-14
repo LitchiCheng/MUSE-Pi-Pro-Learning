@@ -4,6 +4,10 @@
 #   MODEL=../models/yolo11n-seg_opset17.onnx PREFER=cpu ./run-web.sh
 #   STILL=$HOME/work/pics/bus.jpg ./run-web.sh     无光/没摄像头时用静态图演示分割链路
 #   ROTATE=180 ./run-web.sh                          模组装反（画面上下颠倒）时纠偏
+#   MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit ./run-web.sh
+#       官方 int8 走智算核，单帧 ~408ms（float 的 3 倍快）。它崩不崩几乎只取决于
+#       "ORT 线程池有没有和 EP 线程数配平"，见 yolo_seg._tie_intra 的注释；
+#       常驻演示请配 ./supervise-web.sh 兜底，且同一时刻只跑一个实例
 set -uo pipefail
 shopt -s nullglob
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +21,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # "ValidateOpsetForDomain ... Opset 22 is under development"。
 pick_model(){
   local pat
-  # 不选 *.q.onnx：官方 yolov8n-seg.q.onnx 是 13 输出，web 的解码器不支持（见 README）
+  # 默认永远选 float yolo11n-seg：它能连跑几小时。
+  # 官方 int8 *.q.onnx 的 13 输出(DFL)解码已支持、单帧快 3 倍，但 SpaceMIT EP 1.2.2
+  # 在并发采集下几十秒就 SIGSEGV（见 docs/k1-aipu-onnxruntime.md §7），所以不进默认列表，
+  # 要试就显式给 MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit（最好配 supervise-web.sh）。
   for pat in 'yolo11n-seg_opset17.onnx' 'yolo11n-seg_opset*.onnx' '*_qdq*.onnx' '*_qlin*.onnx'; do
     for f in "$HERE"/models/$pat; do
       [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
@@ -28,6 +35,9 @@ pick_model(){
 MODEL=${MODEL:-$(pick_model)}
 [ -n "$MODEL" ] || { echo "[no] models/ 下没有可用的 yolo11n-seg*.onnx，先跑 setup-board.sh"; exit 1; }
 
+export EP_THREADS=${EP_THREADS:-4}   # SPACEMIT_EP_INTRA_THREAD_NUM；只有 int8 模型吃得到
+# ORT 线程池不在这里定：yolo_seg._tie_intra() 会按模型是不是 int8 自动收到和 EP_THREADS 一致
+# （float 模型开满 8 核）。要手工覆盖就 INTRA_THREADS=2 ./run-web.sh。
 ARGS=(--model "$MODEL" --cam "$HERE/cam/k1cam" --port "${PORT:-8000}")
 ARGS+=(--rotate "${ROTATE:-0}")
 [ -n "${WIDTH:-}" ]  && ARGS+=(--width "$WIDTH" --height "${HEIGHT:-$WIDTH}")

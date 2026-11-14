@@ -3,9 +3,17 @@
 对象：MUSE Pi Pro（SpacemiT K1，riscv64）+ `python3-spacemit-ort` + `onnxruntime 1.18.1`。
 模型：ultralytics 官方 `yolo11n-seg.onnx`（float）及其 int8 QDQ 变体。
 
-TL;DR：**float 模型在 K1 上永远跑 CPU，智算核只吃 int8 QDQ。**
+TL;DR：**float 模型在 K1 上永远跑 CPU，智算核只吃官方工具链产出的 int8 图。**
 把 640x640 的 float yolo11n-seg 降到低 opset、开 EP、加线程，全都无效；
-换成量化模型才能进 AIPU（实测 yolov8n-seg 量化版 204 ms/帧）。
+换成量化模型才能进 AIPU（实测 yolov8n-seg 量化版 sess.run 155 ms，端到端 408 ms/帧）。
+
+但 libspacemit_ep 1.2.2 跑 int8 会在连续推理时随机 SIGSEGV，Python 侧完全抓不到（第 7 节）。
+**崩不崩和线程数配置强相关**：`SPACEMIT_EP_INTRA_THREAD_NUM=4` 且把 ORT 的
+`intra_op_num_threads` 也收到 4（两个不一致时最脆），实测 web 常驻连跑
+**32 min / 4559 次推理 0 崩**（§7.1）；老配置（EP 4 线程 + ORT 8 线程）是 **5 min 崩 6 次**。
+代码已按这条自动收线程（`yolo_seg._tie_intra()`）。即便如此板端默认仍是
+"float yolo11n-seg + CPU + 0.6 fps"——int8 那份是 v8 不是 v11，而且长跑样本只有一块板一次，
+要 2.4 fps 就照 §7 末尾显式换模型并挂上看门狗。
 
 ---
 
@@ -98,6 +106,15 @@ python3 ep.py 模型.onnx > run.log 2>&1 && python3 place.py run.log
 （`yolo11n-seg_qdq_conv`（只量 Conv）端到端 3176 ms，比 float 还慢 2~3 倍 —— 量化参数
 在 CPU 侧来回 Q/DQ 的开销全暴露出来了。）
 
+> **算子名分两层，别混**（本轮在板上 `grep -a -o` 二进制复核）：官方 `yolov8n-seg.q.onnx`
+> 的**图里**一个 `QLinearConv` 都没有，只有 251 个 `QuantizeLinear` + 252 个
+> `DequantizeLinear` + 69 个 `Sigmoid` —— 它是 **QDQ 形态**的图；上表"75 个 QLinearConv 在 EP"
+> 是 **Placement 日志里 EP 内部 kernel** 的名字（EP 自己把 QDQ 折成 int8 kernel）。
+> 反过来，我们自己 `--format qoperator` 产的图**层面**就是 QLinearConv 却全落 CPU。
+> 所以"图上写什么算子"不是判据，session 建起来之后 `providers`/Placement 才是。
+> 代码里判"是不是 int8 模型"（只为决定线程池）因此找的是 `QuantizeLinear` 子串，
+> 见 `web/yolo_seg.py` 的 `QUANT_OP_TAGS`。
+
 一句话结论：**K1 的 EP 只认官方工具链（PPQ / ai_toolkit）产出的 int8 形态**，包括自研的
 融合算子（`QLinearSwish` 这种）和配套的 Transpose 布局处理。自己用 onnxruntime 量化器产的
 QDQ/QLinearConv 图，无论怎么写都留在 CPU 上。
@@ -189,6 +206,18 @@ FAIL: Load model ... ValidateOpsetForDomain ... ONNX Runtime only *guarantees* s
 3. 输出布局：`output0 [1,116,8400]`（4 box，输入尺度 cx,cy,w,h + 80 cls + 32 mask coef）、
    `output1 [1,32,160,160]`（protos）。mask 用"只在检测框覆盖的 protos 子块上线性组合"
    的 crop 写法，比全图合成快一个量级（`--mask-mode full` 可切回标准做法核对精度）。
+4. 官方 int8 模型是**另一种布局**：不做层融合，检测头按层摊成 13 个输出
+   （3 尺度 x 的 box[1,64,H,W] DFL logits / cls[1,80,H,W] 已 sigmoid / 系数[1,32,H,W]，
+   再加 3 个 [1,1,H,W] 的 cls-max（忽略）+ proto[1,32,160,160]）。`_classify_outputs()`
+   按 shape 认布局，`_decode_raw()` 解码成同一个 `[1,116,8400]`。DFL 的通道排布是
+   **head-major**：`reshape(4,16,H,W)`，head = left/top/right/bottom、bin 在最后一维
+   （写成 `reshape(16,4,..)` 会解出乱七八糟的框）。解码要点：
+   ```
+   d = softmax(dist.reshape(4,16,H,W), axis=2) @ arange(16)   # 每个 head 的期望距离(单位: stride)
+   w = (d[l] + d[r] + 1) * stride;  cx = (gx + 0.5 + (d[r] - d[l]) / 2) * stride   # 同理 h/cy
+   ```
+   另外那 3 个 [1,1,H,W] 的 cls-max 在 int8 图上是**量化过的概率**（实测与 float cls 的
+   max 平均绝对误差 1.2e-4、最大 0.06，即 int8 噪声），可以直接忽略不读。
 
 ## 6. 抓官方文档正文的技巧
 
@@ -201,3 +230,109 @@ https://cdn-resource.spacemit.com/ai/compute_stack/ai_compute_stack/model_zoo.md
 ```
 
 把 nodepath 的最后一段换成文件名即可；不存在时返回 OSS 的 `NoSuchKey` XML（用这个判断路径写错）。
+
+---
+
+## 7. int8 + EP 能跑，但长跑必崩（SIGSEGV 实测矩阵）
+
+`yolov8n-seg.q.onnx`（官方 int8，13 输出，结构见 §2.1）单次推理确实快：
+`sess.run` 155 ms、`_decode_raw` 54 ms、`postprocess` 44 ms、`draw` 87 ms，端到端 ~420 ms。
+但只要连着跑就会在 `sess.run` 里段错误。**线程数**指
+`SPACEMIT_EP_INTRA_THREAD_NUM`（代码里的 `EP_THREADS`）：
+
+> 下表是早期"单进程死循环"那批数据的汇总；把两个线程变量摊开固定时长对比的是 §7.1。
+
+| EP 线程 | 跑的活 | 结果 |
+|---|---|---|
+| 8 | bus.jpg + 每 5 帧换随机噪声图，单进程死循环 | **4 轮全部崩在 i=74 / 75 / 76 / 32** |
+| 6 | 同上 | 崩在 i=75 |
+| 4 | 同上（死循环） | 一次 400 帧不崩；**换到 web（带采集线程并发）里 i≈26~50 就崩** |
+| 2 / 1 | 同上（死循环） | 600 帧不崩（th=1 端到端 405 ms/帧） |
+| 4 | **web 常驻**（ROTATE=180 + 摄像头 15 fps），ORT 线程池仍是当时的默认 8 | 300s 内崩 6 次（20~94s 一次）；历史最长一次 2035 s / 423 次 |
+| 8 + `enable_cpu_mem_arena=False` 或 `enable_mem_pattern=False` | 死循环 | 仍崩（i=75 / 99）→ 不是 SessionOptions 的内存策略 |
+| 8 + 每 60 次推理重建 session | 死循环 | 仍崩 → 不是"跑久了才坏"，是计数到了某个深度 |
+| 8 + 只 fetch 3/13 个输出 | 死循环 | 跑到 i=50 未崩（样本不足，不能当结论） |
+
+崩溃现场的特征（这些排除了几条常见解释）：
+- 栈顶永远是 `onnxruntime_inference_collection.py:220 run`，开了 `PYTHONFAULTHANDLER`
+  也只有这一帧 —— **没有 Python 异常、没有可捕获的错误码**，进程直接没了。
+- `dmesg` 里没有 segfault / OOM 记录；RSS 稳定在 239 MB 不涨（不是内存泄漏）。
+- 崩完之后 `atexit` 不执行，但因为 k1cam 的 stdout 是父进程的管道，管道一关它自己收到
+  EPIPE 退出，所以**不会**留下 D 状态进程霸占 `/dev/video50`（`ps -eo stat,args | grep k1cam`
+  为空，重启 web 后 8s 内恢复出图）。这一条只在"web 直接父进程被 SEGV 打死"时成立；
+  如果是 `kill -9` 了 python 而 k1cam 还活着，仍会变 D（见 `docs/k1-mipi-camera.md`）。
+
+### 7.1 有一个配置明显更耐跑：ORT 线程池 == EP 线程数（且 <=4）
+
+同一块板、同一份 `yolov8n-seg.q.onnx`、都在 web 里常驻（摄像头 15 fps + `ROTATE=180`），
+每档跑 300s，只看"进程消失了几次"。取数方式是"每档单实例串行"，但**要打折看**：
+本轮末尾发现两批实验脚本的看门狗会并存（`pkill` 后 1s 就重开），并发实例既能把崩溃率
+放大、又有把内核 `misc_open` 打出 Oops 的风险（`docs/k1-mipi-camera.md` §2.5），
+所以矩阵里"崩 N 次"是上界；干净的单实例长跑见下面 §7.2。
+
+| `EP_THREADS`(=SPACEMIT_EP_INTRA_THREAD_NUM) | `intra_op_num_threads`(ORT 线程池) | 300s 内崩溃 |
+|---|---|---|
+| 4 | 8（本项目原默认） | **6 次**（20~94s 一次，均值 ~45s） |
+| 4 | 4 | **0 次** |
+| 8 | 8 | **9 次** |
+| 4 | 1 | **0 次** |
+
+gdb 抓到的崩溃现场支持"线程 id 越界"这个猜测（**这是推断，不是结论**）：崩的那一帧是
+EP 在自己的回调里被 ORT 的线程池调起来的 ——
+
+```
+Thread 15 "python3" received signal SIGSEGV, Segmentation fault.
+#0  ??? () at .../spacemit_ort/libspacemit_ep.so.1.2.2      # 符号被 strip，只能给库内偏移
+#1  ??? () at .../libspacemit_ep.so.1.2.2
+#2  ??? () at .../libspacemit_ep.so.1.2.2
+#3  ??? () at /usr/lib/libonnxruntime.so.1.18.1
+#4  ??? () at /usr/lib/libonnxruntime.so.1.18.1
+#5  std::_Function_handler<void (), onnxruntime::concurrency::ThreadPoolTempl<Env>::
+    ScheduleOnPreferredWorkers(...)::{lambda()#1}>::_M_invoke()   at libonnxruntime.so.1.18.1
+#6  onnxruntime::concurrency::ThreadPoolTempl<Env>::WorkerLoop(int)  at libonnxruntime.so.1.18.1
+#7/#8  ... / start_thread / clone3
+```
+同一时刻另一个 ORT 线程停在 `ThreadPoolTempl::RunInParallel(...)` 上，也就是
+**EP 是用 ORT 的 parallel-for 跑分片的**。如果它按 `worker id` 去索引一个长度只有
+`SPACEMIT_EP_INTRA_THREAD_NUM` 的数组，而 ORT 起了 8 个 worker，id 4~7 就是越界写。
+这解释了 `ep=4/intra=8` 为什么比 `ep=4/intra=4` 脆得多；但解释不了 `ep=8/intra=8`
+（对齐了照样 9 次），所以 EP 里至少还有第二种崩法。复现代码：
+`gdb -q -batch -ex "set pagination off" -ex run -ex "bt 25" -ex "info threads"
+--args python3 web/server.py --model models/yolov8n-seg.q.onnx --prefer spacemit ...`
+（要带 `LD_PRELOAD=/usr/lib/libonnxruntime.so.1.18.1`，否则静默回退 CPU，永远不崩）。
+
+### 7.2 单实例长跑复验：`ep=4 / intra=4` 连跑 32 min 不崩
+
+**长跑复验（同一份 q 模型、单实例 + `supervise-web.sh`，12:22:13 起连跑 32 min）：
+0 次崩溃、0 次看门狗重启**，`infer.runs` 累计 4559、`infer.fps` 稳定 2.43
+（`ms` = infer 283 / post 90 / pre 34 / total 408 / wait 12），`cam.fps` 15.6、
+`cam.restarts` 0、`black_s` 0，这 32 min 里 `dmesg` 没多出任何 Oops。
+同一块板同一份模型，把 intra 改回 8 就是上表的"5 min 崩 6 次"。
+所以 **`ep=4 / intra=4` 是目前唯一可演示的智算核配置**；但它只是一次 32 min 的样本，
+不能说"修好了"，看门狗照挂。
+
+> 补一条"为什么矩阵必须单实例串行跑"的实测：上面 float 的 web 还在跑（8 核几乎占满）时，
+> 另开一发 q 模型做静态图推理，日志照旧是 `intra_op_num_threads=4 (ep=True quant=True ep_threads=4)`、
+> providers 也确实带 SpaceMIT EP，但 `infer` 从 283 ms 涨到 797~1055 ms（5 次均值 1258 ms/帧、
+> 检测框仍是 bus 0.87 / person 0.87/0.85/0.82）。也就是**耗时数字只在单实例下成立**，
+> 两发 web 并存既会让 q 慢到不如 float 单跑，又有把内核打 Oops 的风险（§7.1 末尾）。
+
+代码里已经把这条固化成默认：`make_session()` 不再固定 `intra_op_num_threads=8`，
+改由 `_tie_intra()` 决定 —— **session 真的挂了 SpaceMIT EP 且图里有量化算子**
+（`QuantizeLinear`/`QLinearConv`/`QLinearMatMul`/`ConvInteger`，见 `QUANT_OP_TAGS`）才把 ORT
+线程池收到 `EP_THREADS`，float 模型（含"int8 但 EP 没接住"的自产 QDQ）照旧开满 8 核。
+启动时会在日志里打一行 `[info] intra_op_num_threads=4 (ep=True quant=True ep_threads=4)`，
+要手工对照用 `INTRA_THREADS=<n> ./run-web.sh`。
+
+**能用的处置**：
+1. 默认（本项目就是这么配的）用 float 模型：97 个 Conv 全在 CPU，等于不碰智算核，
+   连跑几小时无崩，0.6 fps。要"跑通 yolo11-seg"也只能用它（官方那份 int8 是 v8）。
+2. 要速度就用官方 int8 + `EP_THREADS=4`：线程池由 `_tie_intra()` 自动配平到 4，
+   实测 32 min 无崩；同时**务必挂 `supervise-web.sh`**（崩了 2s 重开，实测 32s 崩 → 2s 恢复，
+   页面会黑一下），并且**同一时刻只允许一个 web 实例**（并发 open 会把内核打出 Oops）。
+3. 想追根因就往这几个方向试：同一进程里只跑 EP 不跑采集线程能否撑到 1000 次；
+   换 libspacemit_ep 的更新版本；`gdb -batch -ex run -ex bt` 抓 native 栈（本节已抓过一份）。
+
+> 顺带一个坑：`import onnxruntime` 必须在 `import spacemit_ort` **之前**。反序时 float 模型
+> 一切正常，但 int8(QLinearConv) 模型会让 EP 打 `Attempt to use DefaultLogger but none has
+> been registered` 然后**静默回退 CPU**，耗时从 163 ms 变成 ~1371 ms 且没有任何报错提示。

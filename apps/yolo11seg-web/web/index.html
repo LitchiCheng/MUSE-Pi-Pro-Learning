@@ -58,7 +58,7 @@
   <div class="side">
     <h2>参数</h2>
     <div class="row"><label>置信度</label><input type="range" id="conf" min="0.05" max="0.9" step="0.05"><span id="confv" style="width:36px"></span></div>
-    <div class="row"><label>NMS IoU</label><input type="range" id="iou" min="0.3" max="0.9" step="0.05"><span id="iouu" style="width:36px"></span></div>
+    <div class="row"><label>NMS IoU</label><input type="range" id="iou" min="0.3" max="0.9" step="0.05"><span id="iouv" style="width:36px"></span></div>
     <div class="row"><label>mask 透明度</label><input type="range" id="alpha" min="0" max="0.9" step="0.05"><span id="alphav" style="width:36px"></span></div>
     <div class="row"><label>画面帧率</label><input type="range" id="fps_out" min="2" max="25" step="1"><span id="fps_outv" style="width:36px"></span></div>
     <div class="row"><label>JPEG 质量</label><input type="range" id="quality" min="40" max="95" step="5"><span id="qualityv" style="width:36px"></span></div>
@@ -78,6 +78,15 @@ let first=true;
 function start(){ $("stream").src="/video?t="+Date.now(); }
 start();
 
+// 服务端被看门狗重启（或 EP 崩溃后重开）后，浏览器不会自己重连 MJPEG：
+// <img> 的连接一断就标记 broken，等下一次 /stats 又能拉通（说明进程回来了）就重新挂 src。
+// 1.5s 的间隔是为了避免"刚挂上又判错"打转。
+let broken=0;
+$("stream").onerror=()=>{ if(!broken) broken=Date.now(); };
+function rejoin(){
+  if(broken && Date.now()-broken>1500){ start(); broken=0; }
+}
+
 RANGES.forEach(k=>{
   $(k).addEventListener("change",e=>post({[k]:parseFloat(e.target.value)}));
   $(k).addEventListener("input",e=>{ $(k+"v") && ($(k+"v").textContent=e.target.value); });
@@ -93,6 +102,7 @@ async function post(o){ await fetch("/config",{method:"POST",headers:{"Content-T
 async function tick(){
   try{
     const s=await (await fetch("/stats?t="+Date.now())).json();
+    rejoin();
     cur=s.config;
     RANGES.forEach(k=>{ if($(k).value!=String(cur[k]) && document.activeElement!==$(k)) $(k).value=cur[k];
       $(k+"v") && ($(k+"v").textContent=cur[k]); });
@@ -111,7 +121,7 @@ async function tick(){
     if(s.infer.instant_fps<3){ n.style.display="block";
       n.innerHTML="当前分割帧率 "+s.infer.instant_fps.toFixed(2)+" fps：AIPU(SpaceMIT EP) 只接管 int8 量化模型，float32 的 Conv 全部回退到 RISC-V CPU。上方画面流是实时的，分割结果是最近一次推理的叠加。要提速度见 <code>docs/</code> 里的量化说明。"; }
     else n.style.display="none";
-  }catch(e){ $("run").textContent="stats 获取失败: "+e; }
+  }catch(e){ if(!broken) broken=Date.now(); $("run").textContent="stats 获取失败: "+e; }
 }
 setInterval(tick,1000); tick();
 </script>

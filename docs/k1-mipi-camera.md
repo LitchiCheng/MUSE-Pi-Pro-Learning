@@ -47,7 +47,7 @@ gcc v4l2_capture.c v4l2_main.c v4l2_output.c v4l2_stream.c v4l2_common.c -o v4l2
 > 提示：这条命令是判断"到底是驱动问题还是我的代码问题"的分水岭，先跑通它再写代码。
 > 它也能在 PC(x86/aarch64) 上编译后拷进板子，省一轮板端工具链。
 
-## 2. 四条铁律
+## 2. 五条铁律
 
 ### 2.1 `open("/dev/video50")` 会让内核自己拉起一发 cam-test；客户端要重试 EAGAIN
 
@@ -120,6 +120,47 @@ V4L2 多平面 buffer 里 plane1 的 `data_offset` **已经是相对 buffer 起�
 fd 是非阻塞的 + m2m 队列偶发忙，`VIDIOC_QBUF` 返回 EAGAIN 是正常态。直接放弃的话，
 4 个 buffer 用完就再也不会有新帧 —— 症状是"只出 1~2 帧然后卡住/退出"。
 
+### 2.5 多个采集实例并发 `open()` 会打出 kernel Oops，之后谁都起不来（只能重启）
+
+2026-11-14 11:5x，两批实验脚本各自拉起一套 web（3 发 `server.py` 并发 `open`），现场是：
+`ps` 里三个进程全停在 `wchan = misc_open` 的 **DN** 状态，`kill -9` 无效、8000 端口不监听、
+之后再没有任何进程能出图。`dmesg` 给出了原因 —— **open 路径上内核自己 Oops 了**：
+
+```
+Unable to handle kernel paging request at virtual address 0000004c00000033
+Oops [#1]
+CPU: 4 PID: 10782 Comm: python3 Not tainted 6.6.63 #2.2~rc3.2
+Hardware name: spacemit k1-x MUSE-Pi-Pro board (DT)
+ epc : misc_open+0x4a/0x132   ra : misc_open+0x38/0x132
+[<ffffffff8072cb3c>] misc_open+0x4a/0x132
+[<ffffffff802319e2>] chrdev_open+0x9c/0x1fa
+[<ffffffff80228026>] do_dentry_open+0x184/0x382
+...
+[<ffffffff80fe64ea>] ret_from_exception+0x0/0x6e
+---[ end trace 0000000000000000 ]---
+```
+
+同一分钟的 dmesg 里还有配套的握手错乱（**推断**：`/dev/video50` 那发由
+`call_usermodehelper` 拉起的 cam-test 只认"第一个来握手的 pid"，第二个 reader 的
+netlink 请求把内核里记的那个 pid 冲掉了，于是 open 永远等不到应答）：
+
+```
+vcam_wrn: fill_recv_msg_by_nlmsg_data 220: other pid:0 != 10752, don't respond netlink:17
+vcam_wrn: netlink_rcv_msg 295: unexpected resv happen!
+cam_not:vi (spm_vdev_stop_streaming 1197): aout0 total_frm(317) ok_frm(165)   # 165/317，丢一半
+```
+
+运维结论（比"§2.1 只能有 1 发 cam-test"更硬）：
+
+- **`/dev/video50` 同时只允许 1 个 open 者，而且这条要靠流程保证，不是靠"第二个会 EAGAIN 退出"**：
+  实测并发的第二次 open 不总是干净地 EAGAIN，会走进上面那条 Oops 分支，代价是**重启整块板子**。
+- 任何做对照实验的脚本，启动 web 之前必须先 `pgrep -f "web/server[.]py"` 确认为 0；
+  `pkill` 之后至少等 3s 再拉起下一发（老 web 实例的 k1cam 收尾、驱动停流都要时间）。
+- 已经进了 D 状态就别救了吧：`setsid nohup sudo cam-test <json> &`（§2.1 那条救法）
+  对"被 `pkill cam-test` 冻住的流"有效，对这种 **open 里 Oops 掉的任务无效**，
+  只能 `sudo reboot`。reboot 要留够时间：板子上挂着 D 任务时 systemd 停服务会走满超时，
+  本轮实测从下 reboot 到 ssh 可用约 **8 分钟**（不是 1 分钟）。
+
 ## 3. 症状 → 原因 对照（含判据）
 
 拿一帧 NV12（W*H*3/2 字节），算 Y 的 mean/std、UV 的 mean/std：
@@ -131,6 +172,7 @@ fd 是非阻塞的 + m2m 队列偶发忙，`VIDIOC_QBUF` 返回 EAGAIN 是正常
 | 黑且**没有任何噪声纹理** | mean≈1.0, std≈0.5, max=2 | mean≈128, std≈0.3 | **假帧**：有第二发 cam-test 在抢 pipeline（见 2.1）。清到只剩 1 发立刻变真帧 |
 | 黑但有噪声颗粒 | mean 个位数、std>=1 | mean≈128, std≈1~3 | 链路正常，**真的没光**。盖住/照亮镜头数值会变，假帧不会 |
 | 只出 1~2 帧 | 前几帧正常 | | QBUF EAGAIN 没重试（2.4）或 buffer 泄漏，reboot 再来 |
+| web 起不来、`ps` 里进程停在 `misc_open` 且杀不掉 | — | | 并发 open 打出 kernel Oops（2.5），只能 reboot |
 
 ```
 # 本轮（09:47，reboot 后零干预，单实例，1280x720，室内偏暗）
