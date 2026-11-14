@@ -61,3 +61,6 @@ output/*
 # Python
 __pycache__/
 *.pyc
+
+# 板端运行产物（日志/输出图），不入库
+apps/yolo11seg-web/logs/
