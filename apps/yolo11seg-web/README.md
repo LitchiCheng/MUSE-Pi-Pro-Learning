@@ -50,6 +50,7 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 | 看门狗自愈 | **板子** 11:36 | q 模型崩后 `logs/web-supervise.log`: `web 退出（存活 32s，累计第 1 次）` → 2s 后第 2 次启动、`/stats` 恢复出数 |
 | `import onnxruntime` 与 `spacemit_ort` 的顺序 | **板子** 10:4x | 反序 + int8 → EP 报 DefaultLogger 未注册并回退 CPU（`/stats` 的耗时 x10） |
 | `setup-board.sh` 全流程 | 分步在板上手工验证过，脚本整体串跑待复验 | 各步命令与板上实测一一对应 |
+| 「有没有用到智算核」这条判据本身 | **板子** 2026-11-14 13:42 | `./epcheck/run-epcheck.sh`：float 卷积类 CPU 101 个/EP 0 个；官方 int8 卷积类 EP 75 个/CPU 1 个 |
 
 ## 目录结构
 
@@ -64,7 +65,8 @@ apps/yolo11seg-web/
 ├── web/server.py       # Flask 后端：采集线程 + 推理线程(跳帧不排队) + MJPEG
 ├── web/yolo_seg.py     # 预处理/后处理(NMS、mask 合成)/绘制，可单独当命令行自测工具
 ├── web/index.html      # 前端：img 显示 /video，侧栏显示 stats、调 conf/掩码透明度
-└── quant/quant_qdq.py  # PC 端 int8 QDQ 量化（走智算核的唯一路）
+├── quant/quant_qdq.py  # PC 端 int8 QDQ 量化（走智算核的唯一路）
+└── epcheck/            # 板端一条命令出"卷积落在哪个 EP"的账单（判断有没有吃到智算核）
 ```
 
 ## 5 分钟跑通
@@ -139,6 +141,11 @@ ROTATE=180 ./run-web.sh    # OV5647 模组装反（画面上下颠倒）时加 R
 | `/stats` 里 `infer.fps` 远低于 `1/ms.total` | `ms.wait`（等采集帧的毫秒数）与 `cam.fps` | wait 大 → 卡在采集侧（`docs/k1-mipi-camera.md`）；wait≈0 但 fps 低 → 卡在推理线程自身的调度 |
 
 ## 想上智算核（0.6 fps → 2.4 fps，长跑要靠线程数配平）
+
+先明确一句：**当前默认的 float yolo11n-seg 没有用到 K1 的智算核（AIPU/NPU）**，
+101 个卷积类算子全在 RISC-V CPU 上；要用核只能换官方工具链产的 int8 模型。
+板子上跑 `./epcheck/run-epcheck.sh` 就能自己出这张账单（判据与踩坑见
+`docs/k1-aipu-onnxruntime.md` §1.2）。
 
 板上实测过 6 个模型（`docs/k1-aipu-onnxruntime.md` §2.1），结论很硬：
 **只有官方工具链（PPQ / ai_toolkit）产出的 int8 图才会真正落到 AIPU**；

@@ -59,25 +59,49 @@ float 模型也会给你列出这个 provider）。
 > 也是 `spine_subgraphs=0`、不落任何 `*_SpineSubgraph_*.onnx`。按它下"没进 AIPU"的结论会
 > 把所有模型都误判成没加速。`SPACEMIT_EP_DEBUG_PROFILE` 同理没给出可用信息。
 
-能落地的判据是**逐算子的 Placement 日志**：开最啰嗦的日志跑一次，统计
-`Placement:'XxxExecutionProvider'` 出现次数，按 (op 类型, EP) 做直方图。
+能落地的判据是**逐算子的节点归属清单**：开最啰嗦的日志建一次 session，ORT 会打
+`VerifyEachNodeIsAssignedToAnEp`，先按 EP 给一行 "Node(s) placed on [X]. Number of nodes: N"，
+随后逐行列 `OpName (节点名)`。仓库里已经做成一条命令（`apps/yolo11seg-web/epcheck/`）：
 
 ```python
 so = ort.SessionOptions()
-so.log_severity_level = 0        # VERBOSE
+so.log_severity_level = 0        # VERBOSE，节点清单只在这个级别输出
 so.log_verbosity_level = 3
 sess = ort.InferenceSession(m, sess_options=so,
                             providers=["SpaceMITExecutionProvider", "CPUExecutionProvider"])
 ```
 
 ```bash
-# 板端 /tmp/epctl/{ep.py,place.py}：ep.py 跑一次并把 stderr 全存下来，
-# place.py 正则提 (op, Placement) 直方图
-python3 ep.py 模型.onnx > run.log 2>&1 && python3 place.py run.log
+# 在板子上跑，默认对比 float yolo11 与官方 int8 v8 两份；也可以指名别的模型
+cd ~/work/yolo11seg-web && ./epcheck/run-epcheck.sh
+#   ep.py 建 session（带 LD_PRELOAD）把 VERBOSE 日志落盘，place.py 按 EP 分段的清单做直方图
 ```
 
-`place.py` 输出的关键就是 `Conv`/`QLinearConv` 落在哪：全在 `CPUExecutionProvider`
-就等于没加速，跟耗时数字必须对得上（下面 2.1 的表）。
+`place.py` 输出的关键就是**卷积落在哪个 EP 名下**：全在 `CPUExecutionProvider` 就等于没加速，
+必须和耗时数字对得上（下面 2.1 的表）。2026-11-14 13:42 在同一块板上的实际账单：
+
+```
+== yolo11n-seg_opset17.onnx          (float，本项目默认)
+   [SpaceMITExecutionProvider] 自报 191 个节点： Mul x88, Sigmoid x87, Add x13, Sub x2, Div x1
+   [CPUExecutionProvider]      自报 158 个节点： Conv x97, Concat x24, Split x12, Reshape x11,
+                                                MaxPool x3, FusedConv x3, Softmax x2, Resize x2,
+                                                FusedMatMul x2, Transpose x1, ConvTranspose x1
+   Conv 类: CPU 101 个 -> 卷积在 CPU，等于没吃到智算核
+== yolov8n-seg.q.onnx                (官方 int8)
+   [SpaceMITExecutionProvider] 自报 164 个节点： QLinearConv x75, QLinearSwish x66,
+                                                DequantizeLinear x15, QLinearSigmoid x3,
+                                                MaxPool x3, QuantizeLinear x2
+   [CPUExecutionProvider]      自报  55 个节点： Transpose x22, QLinearConcat x13, Split x8,
+                                                QLinearAdd x6, ReduceSum x3, Resize x2, ConvTranspose x1
+   Conv 类: EP 75 个 / CPU 1 个 -> 卷积真的落在智算核的 int8 kernel 上
+```
+
+> **一条订正**（比"float 在 EP 上是白包一层"更准确）：float 模型并不是一个节点都没进 EP ——
+> 191 个逐元素算子（Mul/Sigmoid/Add/Sub/Div）确实归了 SpaceMIT EP，但**全部 101 个卷积类算子
+> 留在 CPU**，而卷积占了 yolo 的几乎全部算力，所以耗时只增不减（1060 ms vs 968 ms）。
+> 判断时**只看卷积**，别被 EP 的节点数唬住。
+> 另外这里出现的 `QLinearConv` 是 **EP 内部的 kernel 名**，不等于图上写了这个算子
+> （官方 q 模型的图层面是 251 QuantizeLinear + 252 DequantizeLinear 的 QDQ 形态，见 §2.1 末尾）。
 
 ## 2. 实测：float 模型不吃 AIPU
 
@@ -96,7 +120,7 @@ python3 ep.py 模型.onnx > run.log 2>&1 && python3 place.py run.log
 
 | 模型 | EP 下耗时 | CPU 下耗时 | 关键算子 Placement | 结论 |
 |---|---|---|---|---|
-| `yolo11n-seg_opset17.onnx`（float，本项目用） | 1060 ms | 968 ms | **97 个 Conv 全在 CPU** | 不吃 AIPU，EP 只是白包一层 |
+| `yolo11n-seg_opset17.onnx`（float，本项目用） | 1060 ms | 968 ms | **卷积类 101 个全在 CPU**（EP 只接走 191 个逐元素算子） | 不吃 AIPU：没有卷积进核 |
 | 官方 `yolov8n-seg.q.onnx`（int8） | **163 ms** | 1371 ms | 75 `QLinearConv` + 66 `QLinearSwish` 在 EP | **8.4x，目前唯一能实时的那条路** |
 | 官方 `yolo11n.q.onnx`（int8, det） | LOAD_FAIL | — | — | `SpaceMITExecutionProvider_QLinearConv_72` 返回 4 |
 | `resnet18.q.onnx`（int8） | 19 ms | — | 在 EP | 参照点，证明板子本身没问题 |
