@@ -8,24 +8,42 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 
 | 项目 | 结果 |
 |---|---|
-| 采集 | 1920x1080 11.8 fps / 1280x720 12.9 fps（`k1cam` 单进程），web 侧稳定 ~15 fps |
-| 推理（float yolo11n-seg @640，CPU 后端） | 单帧 ~968 ms ≈ **1.0 fps**，20 核全占用 |
-| 推理走 SpaceMIT EP（智算核） | **float 模型不加速**，EP 一个 Conv 都不接管（见 `docs/k1-aipu-onnxruntime.md`） |
-| 量化后（int8 QDQ） | yolov8n-seg 实测 204 ms/帧 ≈ 4.9 fps；yolo11n-seg 量化模型已生成，待板上复验 |
-| 结果正确性 | `bus.jpg` 上 CPU 与 EP 输出完全一致：bus 0.89 / person 0.88 / 0.85 / 0.82 / 0.37 |
+| 采集（1280x720 NV12） | web 侧 `cam.fps` 稳定 **15.3~15.4**，72s 无重启无黑帧；`cam-start.sh` 校验 371 帧/24s（13.7 fps，差值是校验脚本自己逐帧做 numpy 统计） |
+| 推理（float yolo11n-seg @640） | 单帧 968 ms（纯推理基准）/ 1233 ms（web 里和采集线程抢核时），**≈0.65~1.0 fps** |
+| 推理走 SpaceMIT EP（智算核） | **float 模型不加速**：Placement 日志显示 97 个 Conv 全在 CPU（判据与矩阵见 `docs/k1-aipu-onnxruntime.md` §1.2/§2.1） |
+| 官方 int8 `yolov8n-seg.q.onnx` | **EP 163 ms vs CPU 1371 ms（8.4x）**，是唯一真正能实时的形态；但它是 13 输出（按层拆开的 DFL 输入），本仓库解码器还不支持 → 待办 |
+| 自产 int8（QDQ / 改写成 QLinearConv） | 3067~3176 ms，**比 float 更慢**：QLinearConv 仍落 CPU |
+| 画面出流（MJPEG 1280x720 q80） | 约 6 帧/s，瓶颈是 K1 上的 JPEG 编码；`/video` 3s 实测 19 帧 |
+| 结果正确性 | `bus.jpg` 上 CPU 与 EP 输出完全一致：bus 0.89 / person 0.88 / 0.85 / 0.82 / 0.37（板上 `/stats` 复核过） |
 
-> 摄像头在暗环境（夜里/无光）下采到的帧 Y 均值 <4，画面近乎全黑，此时 `dets` 为空是正常的，
-> 不是链路坏了。没有光/不想接摄像头时用 `STILL=<图片> ./run-web.sh` 演示分割链路。
+所以现在的"实时"是这样的：**浏览器看到的画面 15 fps，mask 大约每 1.5s 更新一次**
+（HUD 上 `infer ... fps` 是真实分割帧率，`view ... fps` 是画面帧率，不假装实时）。
+`--still` 模式实测 infer 0.86 fps（970 ms/帧）、5 个目标全部正确，说明低的是算力不是链路。
+
+> 摄像头在暗环境下 Y 均值 <4 时画面近乎全黑、`dets` 为空是正常的。但**先分清"没光"和"假帧"**：
+> `curl -s localhost:8000/stats` 看 `cam.lum`（Y 的 std），`lum<2 且 lum_mean<4` 是假帧
+> （有多发 cam-test 在抢 pipeline），有噪声纹理的黑才是真没光。详见 `docs/k1-mipi-camera.md` §3。
+
+## 效果参考（都是板上 `/snapshot.jpg` 原图，未二次加工）
+
+|  |  |
+|---|---|
+| ![live](docs/web-live-720p.jpg) | ![still](docs/web-still-bus.jpg) |
+| 摄像头实时帧 1280x720（室内偏暗，Y p50=17/p99=91，无目标 → `dets` 为空） | 同一套 web、同一份模型，`STILL=bus.jpg` 时的分割叠加（bus 0.89 / person 0.88/0.85/0.82/0.37） |
 
 ## 验证矩阵（哪条结论是在哪儿跑出来的）
 
 | 项 | 在哪验证 | 证据 |
 |---|---|---|
-| `k1cam` 采集 1080p/720p 帧率、NV12 内容 | **板子**（reboot + 单实例 cam-test 后） | 与官方 `v4l2_test_spacemit` 同帧像素统计一致，见 `docs/k1-mipi-camera.md` §3 |
+| 相机零干预出图（reboot 后不手动起任何 cam-test/服务） | **板子** 2026-11-14 10:13（`up 0 min`，`muse-camtest` 已 not-found） | `cam-start.sh`：`frames=308 真帧=308 黑帧=0 零帧=0`、首张真帧 0.4s、退码 0；另一次 09:47 为 `371/370/1/0` |
+| `k1cam` 采集 1080p/720p 帧率、NV12 内容 | **板子** | 与官方 `v4l2_test_spacemit` 同帧像素统计一致，见 `docs/k1-mipi-camera.md` §3/§6 |
+| web 端到端（采集+推理+MJPEG） | **板子** 2026-11-14 09:48~10:03 | `/stats`: `cam.fps 15.33 / lum 11.3 / black_s 0 / restarts 0`；`/video` 3s 抓到 19 帧；`/snapshot.jpg` 拉回 PC 目视确认（`docs/web-live-720p.jpg`） |
+| 模组装反的 180° 纠偏 | **板子** 10:14 | `ROTATE=180 ./run-web.sh`，`/stats` 里 `rotate:180`，截图方向正常 |
+| 退出收尾不留 D 状态采集进程 | **板子** | `kill -TERM <web>` 后 `pgrep -x k1cam` 为空；反例（父进程被 kill 不管子进程）实测会把 k1cam 钉成 D，只能靠重拉 pipeline 或重启板子解开 |
 | float yolo11n-seg CPU 968 ms / EP 1060 ms、检出的 5 个目标 | **板子** | `yolo_seg.py --prefer spacemit`，两后端输出逐目标相同 |
 | `server.py` 全接口（/health /stats /video /snapshot.jpg /config） | 本机(aarch64, ORT 1.32)冒烟 + 板上跑过 | `/stats` 有 5 个目标、`/video` 5 s 出流、`POST /config {"conf":0.5}` 后低分框掉出 |
 | int8 QDQ 模型精度（只量 Conv / 全图+排除 Concat） | **仅 PC**（ORT CPU EP，bus.jpg） | `0.89/0.86/0.85/0.81/0.36` vs float `0.89/0.88/0.85/0.82/0.37` |
-| int8 QDQ 模型能否真的进 AIPU、耗时 | **待板子复验**（开发板 2026-11-14 00:49 起失联，未能上电） | 用 `SPACEMIT_EP_DUMP_SUBGRAPHS=1` 看有没有 SpineSubgraph 产出 |
+| int8 各形态能否进 AIPU、耗时 | **板子** 2026-11-14 08:4x | Placement 直方图 + 端到端耗时，6 个模型矩阵见 `docs/k1-aipu-onnxruntime.md` §2.1（`SPACEMIT_EP_DUMP_SUBGRAPHS` 这条判据被证伪，别再用） |
 | `setup-board.sh` 全流程 | 分步在板上手工验证过，脚本整体串跑待复验 | 各步命令与板上实测一一对应 |
 
 ## 目录结构
@@ -33,7 +51,7 @@ ONNX Runtime(+SpaceMIT EP) 推理 YOLO11n-seg → Flask 出 MJPEG 网页。
 ```
 apps/yolo11seg-web/
 ├── setup-board.sh      # 板端一键：apt 依赖 → 编 k1cam → 配相机 → 下模型/降 opset → 单帧自检
-├── cam-start.sh        # 点亮相机：保证只有一个 cam-test + 用像素统计校验"真的出图了"
+├── cam-start.sh        # 点亮相机：清理多余 cam-test + 用像素统计校验"真的出图了"（不再需要常驻服务）
 ├── run-web.sh          # 启动 web（处理 LD_PRELOAD，参数用环境变量覆盖）
 ├── export_onnx.py      # PC 端：下载官方 yolo11n-seg.onnx 并降到板端能加载的 opset
 ├── cam/k1cam.c         # V4L2(m2m)+dma-buf 采集器，往 stdout 吐 NV12 裸帧
@@ -68,16 +86,20 @@ scp models/yolo11n-seg_opset17.onnx <user>@<板子IP>:work/yolo11seg-web/models/
 ```bash
 cd ~/work/yolo11seg-web
 ./setup-board.sh                 # 依赖 + 编译 + 相机 + 模型 + 自检
-sudo ./setup-board.sh --service  # 需要开机自启时（装 muse-camtest / muse-yolo11seg-web 两个 unit）
+ROTATE=180 sudo ./setup-board.sh --service   # 要开机自启时只装 web 一个 unit（相机不需要服务，见下）
 ```
 
 `MUSE_SUDO_PASS='xxx' ./setup-board.sh` 可以免交互输 sudo 密码；密码不要写进脚本或仓库。
+`--service` 故意**不装 cam-test 的 systemd 服务**：驱动会在 `open()` 时自己拉一发，再起一个
+就是两发抢 pipeline → 恒黑帧（`docs/k1-mipi-camera.md` §2.1）。脚本会顺手把历史遗留的
+`muse-camtest.service` 禁用删除。
 
 ### 4. 启动 + 看
 
 ```bash
-./cam-start.sh        # 显示 [ok] 出图正常（或提示"画面极暗"）后再往下
-./run-web.sh          # 前台；或 PORT=8080 CONF=0.3 ./run-web.sh
+./cam-start.sh        # 显示 [ok] 出图正常: 100% 为真帧 之后再往下
+ROTATE=180 ./run-web.sh    # OV5647 模组装反（画面上下颠倒）时加 ROTATE=180
+# 其它：PORT=8080 CONF=0.3 ./run-web.sh   STILL=/tmp/bus.jpg ./run-web.sh
 ```
 
 浏览器 `http://<板子IP>:8000`。接口：`/video`(MJPEG)、`/snapshot.jpg`、`/stats`、
@@ -86,21 +108,42 @@ sudo ./setup-board.sh --service  # 需要开机自启时（装 muse-camtest / mu
 ## 可调参数
 
 `run-web.sh` 的环境变量：`PORT` `MODEL` `CONF` `WIDTH`(+`HEIGHT`) `PREFER`(auto|spacemit|cpu)
-`STILL`(静态图) `VIDEO`(mp4)。等价的 `server.py` 参数见 `--help`
-（另有 `--cam --dev --cam-log --iou --mask-mode --quality --host`）。
+`STILL`(静态图) `VIDEO`(mp4) `ROTATE`(0/90/180/270)。等价的 `server.py` 参数见 `--help`
+（另有 `--cam --dev --cam-log --iou --mask-mode --quality --host --full-range`）。
+采集端 ioctl 等 cam-test 注册格式的超时用 `K1CAM_WAIT`（秒，默认 20）。
 
-## 想上智算核（把 1 fps 变成 5 fps）
+> 板上 `/tmp` 是 tmpfs，**重启就空**：`STILL=/tmp/bus.jpg` 重启后会报
+> `can't open/read file`（实测踩过）。测试图放 `~/work/pics/` 这种持久目录。
+
+## 排障速查（按现象）
+
+| 现象 | 先查 | 处置 |
+|---|---|---|
+| `S_FMT capture: Resource temporarily unavailable` 后退出 | 是否已有别的进程占着设备：`pgrep -x k1cam` | 设备是独占的。停掉另一个采集端；本仓库的 k1cam 已自带 20s EAGAIN 重试 |
+| 一帧都没有、`ps` 里也没有 cam-test | `cam-start.sh` 会打这条提示 | 内核 open() 自拉的那发握手失败；`cam-start.sh` 会在"窗口内确实 0 帧且 cam-test=0"时补拉一发（一次性，不是常驻循环） |
+| 帧一直在走但画面纯黑、`/stats` 里 `cam.lum≈0.5` | `ps -eo pid,ppid,etime,comm \| grep cam-test` | 有多发 cam-test 抢 pipeline。设备空闲时清到只剩 1 发；**正在推流时绝对不要 `pkill cam-test`**（会把采集端钉成 D 状态，只能重启板子） |
+| 采集进程 `kill -9` 杀不掉、状态 D | `ps -eo pid,stat,comm \| grep k1cam` | 先 `sudo setsid nohup /usr/bin/cam-test /root/svivi_cam1.json &` 恢复出帧再杀；不行就 reboot |
+| 画面上下颠倒 | 模组装反，subdev 无翻转控件 | `ROTATE=180 ./run-web.sh` |
+| 推理只有 1 fps 左右 | `/stats` 的 `model.providers` + `docs/k1-aipu-onnxruntime.md` | float 模型不吃 AIPU 是预期行为，别在量化上继续折腾；要实时看 §"想上智算核" |
+
+## 想上智算核（把 1 fps 变成 6 fps）
+
+板上实测过 6 个模型（`docs/k1-aipu-onnxruntime.md` §2.1），结论很硬：
+**只有官方工具链（PPQ / ai_toolkit）产出的 int8 图才会真正落到 AIPU**；
+自己用 onnxruntime 量化器产的 QDQ（哪怕 `--format qoperator` 改写成 100 个 QLinearConv）
+全部留在 CPU，还比 float 慢 2~3 倍。所以下面这条路只对"用官方工具重量化"有效：
 
 ```bash
-pip install onnx onnxruntime numpy opencv-python-headless    # PC 端，不需要 torch
-python3 quant/quant_qdq.py models/yolo11n-seg_opset17.onnx yolo11n-seg_qdq_conv.onnx --images bus.jpg
-scp yolo11n-seg_qdq_conv.onnx <user>@<板子IP>:work/yolo11seg-web/models/
-MODEL=../models/yolo11n-seg_qdq_conv.onnx PREFER=spacemit ./run-web.sh
+# 官方 int8 模型形态可直接验证收益（v8 seg，163 ms/帧）
+MODEL=models/yolov8n-seg.q.onnx PREFER=spacemit ./run-web.sh
+#   -> 目前会 raise "需要 ultralytics seg 导出(1 输入 2 输出)"：它是 13 输出（按层拆开）
+#      要补一个多尺度 DFL 解码器（web/yolo_seg.py），这是本项目下一步的主要工作
 ```
 
-两种配方（只量 Conv / 全图 QDQ）的区别和坑写在 `quant/quant_qdq.py` 文件头。
-量化后务必先跑 `python3 web/yolo_seg.py --model <量化模型> --image bus.jpg` 对精度，
-再上摄像头。
+自产 QDQ 的两种配方（只量 Conv / 全图 QDQ）区别和坑写在 `quant/quant_qdq.py` 文件头，
+精度在 PC 上验过（`0.89/0.88/0.85/0.79/0.36` vs float `0.89/0.88/0.85/0.82/0.37`），
+但**别指望它提速**。量化模型上板前务必先跑
+`python3 web/yolo_seg.py --model <量化模型> --image bus.jpg` 对精度，再上摄像头。
 
 ## 遇到问题先看这三篇
 

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -82,15 +83,33 @@ static int dmabuf_alloc(int fds[2], size_t need, int *fd_out, size_t *real_out){
   return -1;
 }
 
+/* EAGAIN/EBUSY 时重试到超时；其它 errno 立刻失败。等到点返回非 0。 */
+static int ioctl_wait(int fd, unsigned long req, void *arg, const char *what, int timeout_s, FILE *log){
+  struct timeval t0, t; gettimeofday(&t0, NULL);
+  int tries = 0;
+  for (;;){
+    if (!xioctl(fd, req, arg)) return 0;
+    if (errno != EAGAIN && errno != EBUSY && errno != ETIMEDOUT){ perror(what); return -1; }
+    gettimeofday(&t, NULL);
+    if ((t.tv_sec - t0.tv_sec) >= timeout_s){
+      fprintf(log, "%s: 等 %ds 仍然 EAGAIN/EBUSY（cam-test 没起来？）\n", what, timeout_s);
+      return -1;
+    }
+    if (++tries <= 3) fprintf(log, "  %s EAGAIN, 等 cam-test 注册格式... (%ds)\n", what, (int)(t.tv_sec - t0.tv_sec));
+    usleep(200000);
+  }
+}
+
 int main(int argc, char **argv){
   const char *dev = "/dev/video50";
-  int W = 1280, H = 720, nframes = 0, verbose = 0;
+  int W = 1280, H = 720, nframes = 0, verbose = 0, wait_s = 20;
   __u32 fourcc = V4L2_PIX_FMT_NV12;
   for (int i = 1; i < argc; i++){
     if (!strcmp(argv[i],"-d") && i+1 < argc) dev = argv[++i];
     else if (!strcmp(argv[i],"-W") && i+1 < argc) W = atoi(argv[++i]);
     else if (!strcmp(argv[i],"-H") && i+1 < argc) H = atoi(argv[++i]);
     else if (!strcmp(argv[i],"-n") && i+1 < argc) nframes = atoi(argv[++i]);
+    else if (!strcmp(argv[i],"-w") && i+1 < argc) wait_s = atoi(argv[++i]);
     else if (!strcmp(argv[i],"-f") && i+1 < argc){
       const char *f = argv[++i];
       if (!strcasecmp(f,"NV12")) fourcc = V4L2_PIX_FMT_NV12;
@@ -101,7 +120,7 @@ int main(int argc, char **argv){
     else if (!strcmp(argv[i],"--heap") && i+1 < argc){ g_heap_paths[0] = argv[++i]; g_heap_paths[1] = ""; }
     else if (!strcmp(argv[i],"--hf") && i+1 < argc){ unsigned f = (unsigned)strtoul(argv[++i],0,0);
       g_heap_flags_list[0] = f; g_heap_flags_list[1] = f; }
-    else { fprintf(stderr,"usage: %s [-d dev] [-W w] [-H h] [-f NV12|BGR3] [-n n] [-v]\n", argv[0]); return 1; }
+    else { fprintf(stderr,"usage: %s [-d dev] [-W w] [-H h] [-f NV12|BGR3] [-n n] [-w wait_s] [-v]\n", argv[0]); return 1; }
   }
   signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
   FILE *log = stderr;
@@ -112,13 +131,19 @@ int main(int argc, char **argv){
      上层(server.py)就没法靠超时判断"相机挂了"并重启采集进程 */
   { int fl = fcntl(vfd, F_GETFL, 0); if (fl >= 0) fcntl(vfd, F_SETFL, fl | O_NONBLOCK); }
 
-  /* ---- 1. capture 格式 ---- */
+  /* ---- 1. capture 格式 ----
+   关键: K1 的 vcam 驱动在 open() 时用 call_usermodehelper 自己拉起一发 cam-test
+   (ps 里能看到 PPid=2 的 "/bin/bash -c /usr/bin/cam-test <json>")。cam-test 从被拉起
+   到向内核注册格式要 1~2s, 这期间 S_FMT/REQBUFS 会直接返回 EAGAIN
+   ("Resource temporarily unavailable")。所以这些 ioctl 必须带超时重试, 而不是退出 ——
+   否则客户端要么"打不开相机", 要么被迫在外部常驻一个 supervisor 循环重拉 cam-test,
+   而多拉出来的 cam-test 会和内核自拉的那发抢 pipeline, 结果就是一致地读到黑帧。 */
   struct v4l2_format f; memset(&f, 0, sizeof f);
   f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
   f.fmt.pix_mp.width = W; f.fmt.pix_mp.height = H;
   f.fmt.pix_mp.pixelformat = fourcc; f.fmt.pix_mp.field = V4L2_FIELD_NONE;
   f.fmt.pix_mp.num_planes = 2;
-  if (xioctl(vfd, VIDIOC_S_FMT, &f)){ perror("S_FMT capture"); return 1; }
+  if (ioctl_wait(vfd, VIDIOC_S_FMT, &f, "S_FMT capture", wait_s, log)) return 1;
   int npl = f.fmt.pix_mp.num_planes; if (npl > NP) npl = NP;
   size_t plane_len[NP] = {0, 0};
   for (int p = 0; p < npl; p++) plane_len[p] = f.fmt.pix_mp.plane_fmt[p].sizeimage;
@@ -133,7 +158,7 @@ int main(int argc, char **argv){
   struct v4l2_requestbuffers rq;
   memset(&rq, 0, sizeof rq);
   rq.count = g_nb; rq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; rq.memory = V4L2_MEMORY_DMABUF;
-  if (xioctl(vfd, VIDIOC_REQBUFS, &rq)){ perror("REQBUFS capture"); return 1; }
+  if (ioctl_wait(vfd, VIDIOC_REQBUFS, &rq, "REQBUFS capture", wait_s, log)) return 1;
   size_t rq_count = rq.count < NB ? rq.count : NB;   /* 驱动可能给得比请求少 */
   int heaps[2] = { -1, -1 };
   for (int i = 0; i < 2; i++) heap_open(g_heap_paths[i], &heaps[i]);
@@ -143,7 +168,7 @@ int main(int argc, char **argv){
     struct v4l2_buffer b; struct v4l2_plane pl[NP]; memset(&b, 0, sizeof b); memset(pl, 0, sizeof pl);
     b.index = i; b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; b.memory = V4L2_MEMORY_DMABUF;
     b.length = npl; b.m.planes = pl;
-    if (xioctl(vfd, VIDIOC_QUERYBUF, &b)){ perror("QUERYBUF capture"); return 1; }
+    if (ioctl_wait(vfd, VIDIOC_QUERYBUF, &b, "QUERYBUF capture", wait_s, log)) return 1;
     size_t sum = 0; for (int p = 0; p < npl; p++) sum += pl[p].length;
     if (sum == 0) sum = frame_len;
     int fd; size_t real = 0;
@@ -159,7 +184,7 @@ int main(int argc, char **argv){
     b.length = npl; b.m.planes = pl;
     /* 只填 m.fd, 其余为 0 —— 与官方 queue_all_buffers 一致; 用同一块共享内存占位两个 plane 槽 */
     for (int p = 0; p < npl; p++) pl[p].m.fd = maps_fd[i][p];
-    if (xioctl(vfd, VIDIOC_QBUF, &b)){ perror("QBUF capture"); return 1; }
+    if (ioctl_wait(vfd, VIDIOC_QBUF, &b, "QBUF capture", wait_s, log)) return 1;
   }
   /* 注意: 不主动 munmap/close dma-buf fd, 让 exit 统一回收; 见 cleanup 段 */
   for (int i = 0; i < 2; i++) if (heaps[i] >= 0) close(heaps[i]);
@@ -167,7 +192,7 @@ int main(int argc, char **argv){
   /* ---- 4. 两边 STREAMON (先 capture 后 output, 同官方) ---- */
   enum v4l2_buf_type t;
   t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-  if (xioctl(vfd, VIDIOC_STREAMON, &t)){ perror("STREAMON capture"); return 1; }
+  if (ioctl_wait(vfd, VIDIOC_STREAMON, &t, "STREAMON capture", wait_s, log)) return 1;
   fprintf(log, "streaming...\n");
 
   int done = 0, err = 0;

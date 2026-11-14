@@ -21,6 +21,7 @@ import argparse
 import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -30,6 +31,13 @@ import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROTATE = 0            # 采集帧统一旋转角度（0/90/180/270），由 --rotate 设置
+YUV_FULL_RANGE = False  # --full-range：把 OpenCV 的 limited-range(BT.601) 转换补偿成全量程
+# cv2 的 YUV2BGR 一律按 limited-range 算：R = 1.164*(Y-16) + 1.596*(V-128)。
+# 传感器/ISP 出的是 full-range 时，Y=19 会被压成 3.8（黑场直接剪到 0，YOLO 输入跟着废）。
+# 对结果再套一次 f(x) = x/1.164 + 16 即可等价还原成 full-range：
+#   f(R) = Y + 1.371*(V-128)，而 full-range 真值是 Y + 1.402*(V-128)，偏差 2%（肉眼不可见）。
+RANGE_LUT = np.clip(np.round(np.arange(256, dtype=np.float64) / 1.164 + 16), 0, 255).astype(np.uint8)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 from yolo_seg import PALETTE, YoloSeg  # noqa: E402
@@ -90,37 +98,148 @@ class Config:
         return out
 
 
+
+def rotate_frame(img):
+    """模组装反时用它纠偏：所有采集源在发布前统一旋转，推理与绘制看到的是同一份像素。"""
+    if ROTATE == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if ROTATE == 180:
+        return cv2.flip(img, -1)
+    if ROTATE == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img
 # --------------------------------------------------------------------------- 采集
 class Camera:
     """k1cam 子进程 -> 最新一帧 BGR。进程挂了自动重启。"""
+
+    # 数字黑帧持续多久就在日志里提醒一次（本进程绝不主动 pkill cam-test，见 _lum_stats）
+    BLACK_WARN_S = 5.0
 
     def __init__(self, k1cam, width, height, dev="/dev/video50", log_path="/tmp/k1cam.log"):
         self.bin, self.w, self.h, self.dev = k1cam, width, height, dev
         self.nbytes = width * height * 3 // 2
         self.log_path = log_path
+        self.wait_s = int(os.environ.get("K1CAM_WAIT", "20"))
+        self._last_hint = 0.0
         self._cond = threading.Condition()
         self.frame, self.seq, self.ts = None, 0, 0.0
-        self.stat = {"frames": 0, "restarts": 0, "errors": 0, "opened": False}
+        self.stat = {"frames": 0, "restarts": 0, "errors": 0, "opened": False,
+                     "lum": 0.0, "lum_mean": 0.0, "black_s": 0.0, "stall_s": 0.0, "black_warns": 0,
+                     "yp": None, "help_s": 0.0}
+        self._black_since = None
+        self._last_warn = 0.0
+        self._proc = None                      # 当前 k1cam 子进程（退出时必收尾，见 _cleanup）
         self._stop = False
         self._t0 = time.time()
         self._th = threading.Thread(target=self._run, name="cam", daemon=True)
         self._th.start()
+        # 关键：python 被 kill 掉不管 k1cam 的话，k1cam 会卡在 D 状态一直占着 /dev/video50，
+        # 之后任何进程 open 都只会 EAGAIN，只能重启板子。所以 atexit + 信号都要收尾。
+        atexit.register(self._cleanup)
+        try:
+            signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))   # SystemExit -> atexit 跑 _cleanup
+            signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
+        except Exception:
+            pass
+
+    def _cleanup(self):
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(3)
+        except Exception:
+            proc.kill()
 
     def status(self):
         with self._cond:
             frames, ts = self.stat["frames"], self.ts
         el = max(1e-6, (ts - self._t0) if frames else (time.time() - self._t0))
-        return dict(self.stat, fps=round(frames / el, 2))
+        return dict(self.stat, fps=round(frames / el, 2),
+                    stall_s=round(max(0.0, time.time() - ts) if ts else -1.0, 2),
+                    help_s=round(time.time() - self._t0, 1) if frames == 0 else 0.0)
+
+    def _lum_stats(self, gray):
+        """只统计亮度分布，绝不在这里动 cam-test。
+
+        黑帧签名：Y mean≈1 / std≈0.5 且 UV=128（中性）—— 是"有第二发 cam-test 在抢
+        pipeline"，不是"没光"（没光仍有噪声纹理），也不是"常数 0"（buffer 没被写，
+        那是 dma heap_flags 用错）。
+        实测：在采集端已经 open + STREAMON 时 pkill cam-test，帧数会立刻冻结且 k1cam
+        进入 kill -9 无效的 D 状态，只能重启板子。所以这里只报警、给出手动处置命令，
+        自愈动作交给 _run() 的"子进程退出就重启自己这一发 reader"（不碰 cam-test）。
+        """
+        lum, mean = float(gray.std()), float(gray.mean())
+        black = lum < 2.0 and mean < 4.0
+        now = time.time()
+        # Y 分位数：判"全量程还是 limited-range"只看这个最省事 ——
+        # limited-range 的合法域是 16..235，p0 会顶在 >=16；full-range 则 p0=0、p100=255。
+        p = [int(x) for x in np.percentile(gray, (0, 1, 50, 99, 100))]
+        with self._cond:
+            self.stat["lum"] = round(lum, 1)
+            self.stat["lum_mean"] = round(mean, 1)
+            self.stat["yp"] = p
+            if black:
+                if self._black_since is None:
+                    self._black_since = now
+                self.stat["black_s"] = round(now - self._black_since, 2)
+                need = (self._black_since is not None
+                        and now - self._black_since > self.BLACK_WARN_S
+                        and now - self._last_warn > 30.0)
+            else:
+                self._black_since = None
+                self.stat["black_s"] = 0.0
+                need = False
+            if need:
+                self._last_warn = now
+                self.stat["black_warns"] += 1
+        if need:
+            print("[cam] 连续 %.1fs 数字黑帧(std=%.2f, mean=%.2f)：疑似有第二发 cam-test 在抢 pipeline。"
+                  "查 `ps -eo pid,ppid,etime,comm | grep cam-test` 把多余的清到只剩 1 发；"
+                  "不要 pkill 正在推流的那发（会让本采集进程卡成 D 状态，只能重启板子）"
+                  % (now - self._black_since, lum, mean), file=sys.stderr)
 
     def _spawn(self):
         log = open(self.log_path, "wb")
-        return subprocess.Popen(
-            [self.bin, "-d", self.dev, "-W", str(self.w), "-H", str(self.h), "-f", "NV12", "-n", "0"],
+        proc = subprocess.Popen(
+            [self.bin, "-d", self.dev, "-W", str(self.w), "-H", str(self.h),
+             "-f", "NV12", "-n", "0", "-w", str(self.wait_s)],
             stdout=subprocess.PIPE, stderr=log, bufsize=self.nbytes * 2)
+        self._proc = proc
+        return proc
+
+    def _camtest_n(self):
+        """cam-test 实例数。>1 必黑帧；==0 且我们还没拿到帧 = 内核自拉那发握手失败了。"""
+        try:
+            r = subprocess.run(["pgrep", "-c", "-x", "cam-test"], capture_output=True, timeout=3)
+            return int((r.stdout or b"0").decode().strip() or 0)
+        except Exception:
+            return -1
+
+    def _stuck_hint(self):
+        """一帧都没有时打一条能直接照抄的处置命令（本进程不碰 cam-test，理由见 _lum_stats）。"""
+        if self._last_hint and time.time() - self._last_hint < 30.0:
+            return
+        self._last_hint = time.time()
+        n = self._camtest_n()
+        if n == 0:
+            print("[cam] 0 帧且没有 cam-test 在跑：内核 open() 自拉的那发握手失败了。"
+                  "处置：先 `pgrep -x k1cam` 确认没有残留采集端，再跑 `bash cam-start.sh`"
+                  "（它会在设备空闲时清残留并补拉一发 cam-test）", file=sys.stderr)
+        elif n > 1:
+            print("[cam] 0 帧且有 %d 发 cam-test：多实例会互相抢 pipeline。"
+                  "清到只剩 1 发：ps -eo pid,ppid,etime,comm | grep cam-test" % n, file=sys.stderr)
+        else:
+            print("[cam] 0 帧但有 1 发 cam-test：多半是采集端被卡在 D 状态占着设备，"
+                  "看 `ps -eo pid,stat,comm | grep k1cam`；D 状态 kill -9 无效，"
+                  "要么把 pipeline 恢复出帧再杀，要么重启板子", file=sys.stderr)
 
     def _publish(self, bgr):
+        if YUV_FULL_RANGE:
+            bgr = cv2.LUT(bgr, RANGE_LUT)
         with self._cond:
-            self.frame, self.ts = bgr, time.time()
+            self.frame, self.ts = rotate_frame(bgr), time.time()
             self.seq += 1
             self.stat["frames"] += 1
             self._cond.notify_all()
@@ -142,11 +261,18 @@ class Camera:
                     plane = np.frombuffer(bytes(buf), np.uint8).reshape(self.h * 3 // 2, self.w)
                     buf = bytearray()
                     self._publish(cv2.cvtColor(plane, cv2.COLOR_YUV2BGR_NV12))
+                    # 亮度统计在小尺寸灰度上做，单帧开销 <1ms（plane 是 NV12：前 h 行是 Y）
+                    self._lum_stats(cv2.resize(plane[:self.h:2, :self.w:2], (160, 90),
+                                               interpolation=cv2.INTER_AREA))
             except Exception as exc:  # noqa: BLE001
                 self.stat["errors"] += 1
                 print("[cam] 异常: %r" % (exc,), file=sys.stderr)
             finally:
                 self.stat["opened"] = False
+                with self._cond:
+                    got_any = self.stat["frames"] > 0
+                if not got_any:
+                    self._stuck_hint()
                 if proc:
                     proc.terminate()
                     try:
@@ -178,7 +304,7 @@ class StillSource:
         img = cv2.imread(path)
         if img is None:
             raise SystemExit("读不到 %s" % path)
-        self.base, self.frame, self.seq, self.ts = img, None, 0, 0.0
+        self.base, self.frame, self.seq, self.ts = rotate_frame(img), None, 0, 0.0
         self._t0, self._fps = time.time(), fps
         self._cond = threading.Condition()
         self._stop = False
@@ -286,6 +412,7 @@ class App:
         elif args.still:
             self.src = StillSource(args.still)
         else:
+            self.cam_log = args.cam_log
             self.src = Camera(args.cam, args.width, args.height, args.dev, args.cam_log)
         self.eng = Engine(self.model, self.src, self.cfg)
         self.t0 = time.time()
@@ -306,7 +433,12 @@ class App:
             "cam": {"fps": cam_st["fps"], "size": [self.src.w if hasattr(self.src, "w") else 0,
                                                    self.src.h if hasattr(self.src, "h") else 0],
                     "frames": cam_st["frames"], "restarts": cam_st["restarts"],
-                    "errors": cam_st["errors"]},
+                    "errors": cam_st["errors"],
+                    # lum=Y 平面方差, lum_mean=Y 均值；lum<2 且 lum_mean<4 => cam-test 没在推流的黑帧
+                    "lum": cam_st.get("lum"), "lum_mean": cam_st.get("lum_mean"),
+                    "black_s": cam_st.get("black_s"), "stall_s": cam_st.get("stall_s"),
+                    "black_warns": cam_st.get("black_warns"), "yp": cam_st.get("yp"),
+                    "rotate": ROTATE, "log": self.cam_log if hasattr(self, "cam_log") else None},
             "view_fps": round(view_fps, 2),
             "infer": {"fps": round(runs / max(1e-6, now - self.eng.t0), 2),
                       "instant_fps": round(1000.0 / max(1e-6, ms["total"]), 2), "runs": runs,
@@ -361,7 +493,7 @@ class StillSourceVideo(StillSource):
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             with self._cond:
-                self.frame, self.seq = f, self.seq + 1
+                self.frame, self.seq = rotate_frame(f), self.seq + 1
                 self._cond.notify_all()
 
     def latest(self, timeout=2.0):
@@ -438,7 +570,15 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--still", help="无摄像头时用一张图当输入（调试）")
     ap.add_argument("--video", help="无摄像头时用 mp4 当输入（调试）")
+    ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                    help="采集帧旋转角度；OV5647 模组装反时用 180")
+    ap.add_argument("--full-range", action="store_true",
+                    help="NV12 是 full-range(JPEG 那种) 时用它补偿 cv2 默认的 limited-range 转换，"
+                         "否则暗部会被整体压到 0（既难看也废掉模型输入）")
     args = ap.parse_args()
+    global ROTATE, YUV_FULL_RANGE
+    ROTATE = args.rotate
+    YUV_FULL_RANGE = args.full_range
     if not os.path.exists(args.model):
         raise SystemExit("模型不存在: %s" % args.model)
     app = App(args)

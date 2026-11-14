@@ -43,17 +43,33 @@ sess = ort.InferenceSession(m, providers=["SpaceMITExecutionProvider", "CPUExecu
 print(sess.get_providers())              # 只有这里能看到实际生效顺序
 ```
 
-**但 `get_providers()` 里有 SpaceMIT ≠ 算子在智算核上跑**（EP 只做子图划分）。
-最硬的判据是导出子图：
+**但 `get_providers()` 里有 SpaceMIT ≠ 算子在智算核上跑**（EP 只做子图划分，
+float 模型也会给你列出这个 provider）。
+
+> **订正**：网上/文档里流传的 `SPACEMIT_EP_DUMP_SUBGRAPHS=1` 在 K1 这版 runtime 上
+> **不能用** —— 连确定吃到加速的官方 `yolov8n-seg.q.onnx`（实测 163ms vs CPU 1371ms）
+> 也是 `spine_subgraphs=0`、不落任何 `*_SpineSubgraph_*.onnx`。按它下"没进 AIPU"的结论会
+> 把所有模型都误判成没加速。`SPACEMIT_EP_DEBUG_PROFILE` 同理没给出可用信息。
+
+能落地的判据是**逐算子的 Placement 日志**：开最啰嗦的日志跑一次，统计
+`Placement:'XxxExecutionProvider'` 出现次数，按 (op 类型, EP) 做直方图。
 
 ```python
-provider_options = [{"SPACEMIT_EP_DUMP_SUBGRAPHS": "1"}, {}]
+so = ort.SessionOptions()
+so.log_severity_level = 0        # VERBOSE
+so.log_verbosity_level = 3
+sess = ort.InferenceSession(m, sess_options=so,
+                            providers=["SpaceMITExecutionProvider", "CPUExecutionProvider"])
 ```
 
-工作目录会出现 `SpaceMITExecutionProvider_SpineSubgraph_*.onnx`：
-- 有 float yolo11n-seg 的 0 个/极小子图 → Conv 全在 CPU；
-- int8 QDQ 模型里 Conv 出现在子图内 → 真的进了 AIPU。
-（`SPACEMIT_EP_DEBUG_PROFILE="demo"` 可以进一步导出每段耗时。）
+```bash
+# 板端 /tmp/epctl/{ep.py,place.py}：ep.py 跑一次并把 stderr 全存下来，
+# place.py 正则提 (op, Placement) 直方图
+python3 ep.py 模型.onnx > run.log 2>&1 && python3 place.py run.log
+```
+
+`place.py` 输出的关键就是 `Conv`/`QLinearConv` 落在哪：全在 `CPUExecutionProvider`
+就等于没加速，跟耗时数字必须对得上（下面 2.1 的表）。
 
 ## 2. 实测：float 模型不吃 AIPU
 
@@ -68,6 +84,24 @@ provider_options = [{"SPACEMIT_EP_DUMP_SUBGRAPHS": "1"}, {}]
 官方 `ai_tool/aiLib/yolo11n.onnx`（他们自己给的 float 模型）在 EP 下同样整图回 CPU。
 另外试过 opset 14/15/17/18 四个版本，**都不改变这一结论**。
 
+### 2.1 六个模型的完整实测矩阵（同一块板、640x640、bus.jpg）
+
+| 模型 | EP 下耗时 | CPU 下耗时 | 关键算子 Placement | 结论 |
+|---|---|---|---|---|
+| `yolo11n-seg_opset17.onnx`（float，本项目用） | 1060 ms | 968 ms | **97 个 Conv 全在 CPU** | 不吃 AIPU，EP 只是白包一层 |
+| 官方 `yolov8n-seg.q.onnx`（int8） | **163 ms** | 1371 ms | 75 `QLinearConv` + 66 `QLinearSwish` 在 EP | **8.4x，目前唯一能实时的那条路** |
+| 官方 `yolo11n.q.onnx`（int8, det） | LOAD_FAIL | — | — | `SpaceMITExecutionProvider_QLinearConv_72` 返回 4 |
+| `resnet18.q.onnx`（int8） | 19 ms | — | 在 EP | 参照点，证明板子本身没问题 |
+| 我们的整图 QDQ | LOAD_FAIL | — | — | `EP does not support Compile`（见 3.x） |
+| 我们的 QDQ→`--format qoperator` | 3067 ms | — | 100 个 `QLinearConv` **仍在 CPU** | 光是把 QDQ 改写成 QLinearConv 不会上智算核 |
+
+（`yolo11n-seg_qdq_conv`（只量 Conv）端到端 3176 ms，比 float 还慢 2~3 倍 —— 量化参数
+在 CPU 侧来回 Q/DQ 的开销全暴露出来了。）
+
+一句话结论：**K1 的 EP 只认官方工具链（PPQ / ai_toolkit）产出的 int8 形态**，包括自研的
+融合算子（`QLinearSwish` 这种）和配套的 Transpose 布局处理。自己用 onnxruntime 量化器产的
+QDQ/QLinearConv 图，无论怎么写都留在 CPU 上。
+
 ## 3. 要进 AIPU：整图 int8 QDQ
 
 ### 3.1 什么格式算"对"
@@ -77,11 +111,19 @@ float 输入 → QuantizeLinear → DequantizeLinear → Conv(int8 权重) → Q
 ```
 
 即**激活和权重都要量化**。只把权重换成 int8 + DequantizeLinear（激活保持 float）不够，
-Conv 依然留在 CPU。反例：`QLinearConv` 这种"整算子量化"写法，K1 的 EP 直接建不出来：
+Conv 依然留在 CPU。
+
+关于 `QLinearConv`（"整算子量化"写法）要说准确：**它本身不是禁词** —— 官方
+`yolov8n-seg.q.onnx` 里的 75 个 `QLinearConv` 就实实在在落在 EP 上。但**我们自己图里**的
+QLinearConv 建不出来 / 建出来也在 CPU：
 
 ```
-create_operator 'SpaceMITExecutionProvider_QLinearConv_72'(QLinearConv_qc8) returned 4
+create_operator 'SpaceMITExecutionProvider_QLinearConv_72'(QLinearConv_qc8) returned 4   # 官方 yolo11n.q.onnx 也这样
 ```
+
+也就是说决定成败的不是"QDQ 还是 QLinearConv"，而是**这张图是不是官方工具链按它认识的
+pattern 产出的**。这一点在本轮用 `--format qoperator` 把 QDQ 全图改写成 100 个
+QLinearConv 之后被反证：算子类型对了，Placement 仍然全是 CPU。
 
 参考数据（同一块板、640x640）：`resnet18.q.onnx` 19 ms、`yolov8n-seg.q.onnx` 204 ms，
 说明格式对了提速是实打实的。官方 modelzoo 给的口径：resnet18 int8 12.99 ms、

@@ -2,7 +2,7 @@
 # MUSE Pi Pro (SpacemiT K1 / Bianbu Star) 板端一键环境准备。在开发板上执行：
 #
 #   ./setup-board.sh                依赖 + k1cam + 相机配置 + 模型 + 单帧自检
-#   ./setup-board.sh --service      额外装两个 systemd 服务（cam-test + web）并开机自启
+#   ./setup-board.sh --service      额外装 web 的 systemd 服务并开机自启（相机不需要服务，见 §2.1）
 #   ./setup-board.sh --skip-camera  只处理软件依赖和模型
 #   ./setup-board.sh --no-model     不下载模型（自己放好后重跑）
 #
@@ -88,7 +88,9 @@ if [ "$SKIP_CAMERA" = 1 ]; then warn "按参数跳过"; else
     command -v cam-test >/dev/null || bad "板上没有 cam-test，无法自动探测 sensor，请按官方文档手动配置"
     if [ -f "$CSI_JSON" ] && command -v cam-test >/dev/null; then
       warn "用 $CSI_JSON 探测 sensor（约 20s，会占住 CSI 口）"
-      SUDO pkill -9 -f cam-test 2>/dev/null; sleep 1
+      # 必须 -x：-f 会匹配到"执行这条 pkill 的 shell 自己"（cmdline 里含 cam-test），
+      # ssh 远程跑时会把会话自己杀掉还不报错
+      SUDO pkill -9 -x cam-test 2>/dev/null; sleep 1
       SUDO timeout 60 cam-test "$CSI_JSON" >/tmp/camtest.log 2>&1
       grep -oE "detect [a-z0-9_]+ sensors in csi[0-9]: success" /tmp/camtest.log | tail -1 | sed 's/^/      /'
       AUTO=$(ls -t /tmp/csi*_camera_auto.json 2>/dev/null | head -1)
@@ -177,30 +179,33 @@ if [ "$DO_SERVICE" = 1 ] && [ -z "$MODEL" ]; then
   DO_SERVICE=0
 fi
 if [ "$DO_SERVICE" = 1 ]; then
-  SUDO tee /etc/systemd/system/muse-camtest.service >/dev/null <<EOF
-[Unit]
-Description=MUSE Pi Pro camera pipeline (cam-test / svivi virtual camera)
-After=local-fs.target
-
-[Service]
-ExecStart=/usr/bin/cam-test $SVIVI_JSON
-Restart=always
-RestartSec=3
-EOF
+  # 注意：**不装 cam-test 的 systemd 服务**。K1 的 vcam 驱动在客户端 open("/dev/video50")
+  # 时用 call_usermodehelper 自己拉起一发 cam-test（实测 PPid=2），采集端只要对 S_FMT 的
+  # EAGAIN 重试就能出图（k1cam -w，默认 20s）。再起一个常驻服务 = 两发 cam-test 抢
+  # pipeline = 恒黑帧。这个坑在 docs/k1-mipi-camera.md §2.1 有完整实测。
+  if SUDO systemctl list-unit-files 2>/dev/null | grep -q '^muse-camtest[.]service'; then
+    warn "检测到历史遗留的 muse-camtest.service（会造成恒黑帧），正在禁用并删除"
+    SUDO systemctl disable --now muse-camtest.service 2>/dev/null
+    SUDO rm -f /etc/systemd/system/muse-camtest.service
+    SUDO pkill -9 -x cam-test 2>/dev/null      # 此刻没有采集端在推流，清理是安全的
+  fi
   SUDO tee /etc/systemd/system/muse-yolo11seg-web.service >/dev/null <<EOF
 [Unit]
 Description=MUSE Pi Pro YOLO11-seg realtime segmentation web
-After=muse-camtest.service
-Requires=muse-camtest.service
+After=network.target local-fs.target
 
 [Service]
 Environment=LD_PRELOAD=/usr/lib/libonnxruntime.so.1.18.1
 WorkingDirectory=$HERE/web
-ExecStart=/usr/bin/python3 $HERE/web/server.py --model $MODEL --cam $HERE/cam/k1cam --port 8000
+# --rotate 180：OV5647 模组装反时画面上下颠倒，subdev 没有任何翻转控件，只能在采集源纠偏
+ExecStart=/usr/bin/python3 $HERE/web/server.py --model $MODEL --cam $HERE/cam/k1cam --port 8000 --rotate ${ROTATE:-0}
 Restart=on-failure
 RestartSec=5
+# 收尾必须发 TERM：server.py 会先杀自己的 k1cam 子进程。直接 KILL 会留下卡在 D 状态的
+# k1cam 一直占着 /dev/video50，之后谁都打不开，只能重启板子。
+TimeoutStopSec=10
 EOF
-  SUDO systemctl daemon-reload && SUDO systemctl enable --now muse-camtest.service && SUDO systemctl enable --now muse-yolo11seg-web.service
+  SUDO systemctl daemon-reload && SUDO systemctl enable --now muse-yolo11seg-web.service
   sleep 8
   SUDO systemctl --no-pager --full status muse-yolo11seg-web.service 2>&1 | head -8 | sed 's/^/    /'
   warn "浏览器打开 http://<板子IP>:8000"

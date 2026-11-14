@@ -11,12 +11,18 @@
 ```
 OV5647 --(MIPI CSI3)--> ISP -->  /dev/video50  (spacemit "vivi" 虚拟相机, m2m)
                                    ↑
-                    /usr/bin/cam-test <svivi.json>  常驻，负责 sensor/ISP pipeline
+                        open() 时内核 call_usermodehelper 自动拉起
+                                   ↓
+                    /usr/bin/cam-test <svivi.json>  负责 sensor/ISP pipeline
 ```
 
 `/dev/video50` 只是一个"把 ISP 出的帧以 V4L2 capture 形式吐出来"的虚拟节点，**它自己不会
-去开 sensor**。没有 cam-test 在跑时，节点存在、ioctl 全都成功、帧也"采得到"，但内容是
-全 0 或上一段内存的残留 —— 这是最容易骗人的地方。
+去开 sensor**。没有 cam-test 推流时，节点存在、ioctl 不报错、帧也"读得到"，但内容是全 0
+或恒定的假帧 —— 这是最容易骗人的地方。
+
+> **2026-11 订正**：本文早期版本写过"cam-test 必须常驻 / 跑约 10s 自己退出 / 需要 supervisor
+> 循环或开机自启服务"。那是错的（而且按它做会稳定得到黑帧）。真实机制是 **open() 触发内核
+> 自拉 cam-test**，帧流起来之后可以持续几十秒不重启（见 2.1）。
 
 ## 1. 官方流程（照做，但不够）
 
@@ -43,25 +49,44 @@ gcc v4l2_capture.c v4l2_main.c v4l2_output.c v4l2_stream.c v4l2_common.c -o v4l2
 
 ## 2. 四条铁律
 
-### 2.1 cam-test 必须常驻，而且只能有 1 个实例；板子重启后没人启动它
+### 2.1 `open("/dev/video50")` 会让内核自己拉起一发 cam-test；客户端要重试 EAGAIN
 
-- `camera.service`（`/etc/init.d/camera.sh`）**只做 chmod**，不负责拉 cam-test。
-  也就是说：重启之后 `/dev/video50` 在、权限对、ioctl 不报错，但**读不到真帧**。
-  → 我们用 `cam-start.sh`（或 `--install` 装的 `muse-camtest.service`）补这一环。
-- 多开的表现：后起实例日志里
-  `Bind TCP server socket failed ... error(98)`（抢 tuning server 端口 12218），
-  然后 `v4l2_single_online_test: wait kernel stream on ... Resource temporarily unavailable`，
-  最后自己 `finish power off` —— 它把 pipeline 关了，于是**先起来的那个也采不到帧了**。
+这是本轮最关键的一条，推翻"必须常驻/必须有 supervisor"的旧结论。三条实测证据：
 
-拉起方式（不依赖终端，退出 ssh 不会被杀）：
+1. 板上什么都没跑（`pgrep -c -x cam-test` = 0、没有自启服务）时，只要有一个进程
+   `open()` 了这个节点，`ps` 里就会多出一发：
+   `/bin/bash -c /usr/bin/cam-test /root/svivi_cam1.json > /tmp/svivi_cam1.log 2>&1`，
+   **PPid = 2（kthreadd）** —— 这是 `call_usermodehelper` 的典型特征，不是任何服务干的。
+2. cam-test 从被拉起到向内核注册格式要 1~2s，这期间客户端的 `VIDIOC_S_FMT`/`REQBUFS`/
+   `QUERYBUF`/`QBUF`/`STREAMON` 会直接返回 **EAGAIN**（`Resource temporarily unavailable`）。
+   官方示例代码一次 ioctl 失败就退出，所以表现为"打不开相机"。
+   → `k1cam.c` 里这些 ioctl 统一走 `ioctl_wait()`：只对 EAGAIN/EBUSY/ETIMEDOUT 以 200ms
+   间隔重试，默认上限 20s（`-w` 可改），其它 errno 立即失败。加上这个改动后，
+   **reboot 之后零人工干预**就能出图（10:13，`uptime` 显示 up 0 min、`muse-camtest` 已
+   not-found、`pgrep -c -x cam-test` = 0）：`cam-start.sh` 实测 `frames=308 真帧=308
+   黑帧=0 零帧=0`、首张真帧 t=0.4s、退码 0；另一次（09:47）是 `371/370/1/0`。
+3. 格式注册成功之后帧流是**持续**的：同一进程连续跑 72s，`cam-test` 数恒为 1、
+   采集端 `restarts=0`、`black_s=0`，web 侧 `cam.fps=15.4`。所以不需要任何 supervisor。
 
-```bash
-sudo sh -c 'setsid nohup /usr/bin/cam-test /root/svivi_cam1.json > /tmp/svivi_cam1.log 2>&1 < /dev/null &'
-sleep 8
-```
+由此得到两条运维规则：
 
-- `/dev/video50` 同时只允许**一个**采集客户端：第二个进程 `S_FMT` 会返回
-  `Resource temporarily unavailable`。web 服务里那个"采集线程重启"逻辑就是为独占这个 fd 设计的。
+- **只能有 1 发 cam-test**。2~3 发并存会互相抢 pipeline，症状是**恒定黑帧**
+  （Y mean≈1.0 / std≈0.5 / max=2 / UV=128，实测多实例时帧帧如此）。上一版为了"自愈"
+  留的 supervisor 循环 + 内核自拉的那发正好是两个实例 —— 黑帧就是这么制造出来的。
+  `cam-start.sh` 现在只做一件事：在**确认没有采集端在推流**时把多余实例（含历史遗留的
+  supervisor shell）清掉，然后交给 open() 自拉。
+- **绝不要在采集端已经 open + STREAMON 之后 `pkill cam-test`**。实测帧数会立刻冻结
+  （2450 之后不再涨），`k1cam` 进入 `kill -9` 也杀不掉的 **D 状态**并继续占着设备，
+  之后任何进程 open 都只会 EAGAIN，只能重启板子。
+  救法（本轮实测有效，比重启快）：`sudo setsid nohup /usr/bin/cam-test <json> &`
+  把 pipeline 重新跑出帧，卡住的那发 k1cam 就能被 kill 掉了。
+  所以 web 进程退出时必须**正常收尾**自己的 k1cam 子进程：`server.py` 里挂了
+  `atexit` + SIGTERM/SIGINT 处理，实测 `kill -TERM <web>` 之后 `pgrep -x k1cam` 为空。
+
+顺带修正 2.1 的旧说法："`/dev/video50` 同时只允许一个采集客户端"仍然成立 —— 第二个
+reader 的 `S_FMT` 会一直 EAGAIN 到超时（实测 20s 打满后报
+`等 20s 仍然 EAGAIN/EBUSY（cam-test 没起来？）`），所以 `cam-start.sh` 在校验前会先
+`pgrep -x k1cam`，发现占用就直接报错退出而不是继续"验证"。
 
 ### 2.2 capture buffer 要用 `heap_flags=0xf0` 申请，且必须按真实大小 mmap
 
@@ -103,17 +128,30 @@ fd 是非阻塞的 + m2m 队列偶发忙，`VIDIOC_QBUF` 返回 EAGAIN 是正常
 |---|---|---|---|
 | 全 0 | mean≈0, std≈0 | mean≈0, std≈0 | 驱动没写进你的 buffer：cam-test 没跑 / 多开 / heap_flags 不是 0xf0 |
 | 彩色噪声花屏 | 抖动大 | std 远大于 10 | 读的是未初始化内存，或 plane 偏移算错（见 2.3） |
-| 全黑但有细节 | std 很小(约 0.5)、max 只有个位数 | mean≈128, std≈0.3 | **链路完全正常，只是环境没光**（UV=128 是灰/黑的中性色度，正好证明帧是真的） |
+| 黑且**没有任何噪声纹理** | mean≈1.0, std≈0.5, max=2 | mean≈128, std≈0.3 | **假帧**：有第二发 cam-test 在抢 pipeline（见 2.1）。清到只剩 1 发立刻变真帧 |
+| 黑但有噪声颗粒 | mean 个位数、std>=1 | mean≈128, std≈1~3 | 链路正常，**真的没光**。盖住/照亮镜头数值会变，假帧不会 |
 | 只出 1~2 帧 | 前几帧正常 | | QBUF EAGAIN 没重试（2.4）或 buffer 泄漏，reboot 再来 |
 
-实测样本（00:47，reboot + 单实例 cam-test 后，1920x1080，环境全黑）：
-
 ```
-f0  Y mean 1.07  std 0.52  min 0  max 2 | chroma mean 127.9  std 0.3     # 官方 v4l2_test_spacemit
-    同一帧经 k1cam：1920x1080 40帧/3.4s = 11.8 fps，1280x720 40帧/3.1s = 12.9 fps
+# 本轮（09:47，reboot 后零干预，单实例，1280x720，室内偏暗）
+frames=371 | 真帧=370 黑帧=1 零帧=0 | 首张真图 t=0.4s      -> [ok] 100% 为真帧 13.7 fps
+# 同一时刻 web 侧 /stats：cam.fps 15.33, lum(Y std) 11.3, lum_mean 19.4, black_s 0, restarts 0
+# 多实例对照（09:2x，supervisor + 内核自拉 = 2~3 发并存）
+每帧 Y mean≈1.0 std≈0.5 max=2, UV=128                    -> 恒黑帧，与"没光"完全不同
 ```
 
-`cam-start.sh` 把这套判据写成了脚本，退出码分别是 2(没整帧)/3(全 0)/4(噪声)/0(正常或极暗)。
+> 判黑帧时 **std 比 mean 可靠**：真暗场景的 Y 也有 1~3 的噪声，假帧的 std 只有 0.5 左右。
+> 光看"画面全黑"就下结论"夜里没光"是踩过两次的坑。
+
+`cam-start.sh` 把这套判据写成了脚本，退出码 2(没整帧)/3(全 0 帧)/4(噪声或真帧占比过低)/0(正常)。
+
+另外一条**新踩的坑**：暗场景下 `cv2.cvtColor(plane, COLOR_YUV2BGR_NV12)` 看着比原始 Y 暗得多
+（原始 Y mean=19.4 → BGR 灰度 mean 只有 3.8）。不是 bug：cv2 一律按 **limited-range**
+（`R=1.164*(Y-16)+…`）换算，Y=19 会被压到 4。判自己的板子是哪种量程就看 Y 的下界：
+`np.percentile(Y,(0,1,50,99,100))` 实测 `[17,17,17,89,116]`，地板正好停在 16 附近
+→ **本板 ISP 输出是 limited-range，cv2 的默认转换是对的，不要开 `--full-range`**。
+（若哪天拿到 0..255 全量程的流，`server.py --full-range` 会对 BGR 结果套一次
+`x/1.164+16` 的 LUT，等价还原成 full-range，色度误差 2%。）
 
 ## 4. 硬件与编号细节
 
@@ -136,3 +174,27 @@ f0  Y mean 1.07  std 0.52  min 0  max 2 | chroma mean 127.9  std 0.3     # 官�
 - 采集不需要 sudo（`/dev/video50`、`/dev/dma_heap/*` 权限已放开）；只有起 cam-test 需要 sudo。
 - 板子默认 shell 是 **zsh**，远程批量命令建议 `ssh <user>@<ip> bash -s <<'EOS' ... EOS`，
   否则 `shopt`/数组/`[[ ]]` 之类会踩到 zsh 的差异。
+- **模组装反 → 画面上下颠倒 180°**，而 sensor/ISP subdev 一个 v4l2 控件都不暴露
+  （`v4l2-ctl -d /dev/v4l-subdev1 --list-ctrls` 输出为空），没有任何"翻转"开关可走。
+  所以在采集源发布前统一旋转：`server.py --rotate 180`（0/90/180/270，
+  `run-web.sh` 用 `ROTATE=180` 传）。放在发布前是为了**让推理和绘制看同一份像素**，
+  否则框对、mask 错。
+- 在板上用 shell 数进程有两个坑：
+  `pgrep -c cam-test` 在**没匹配时也打印 0 但退码 1**，写 `$(pgrep -c -x cam-test || echo 0)`
+  会拿到两行 0，`[ 0\n0 -gt 1 ]` 直接报 integer expression expected；
+  `pgrep -f`/`pkill -f` 会匹配到**执行这条命令的 shell 自己**（cmdline 里含同样的字符串），
+  ssh 远程执行时会把会话自己杀掉且没有任何报错。统一用 `-x 进程名`，
+  非要按 cmdline 匹配就写 `pkill -f "server[.]py"`。
+- 探针脚本别用 `-n 0` 往 `/tmp` 写原始 NV12：1280x720 一帧 1.38MB、15fps = 20MB/s，
+  跑十分钟就是 13GB。用完立刻 `pkill -x k1cam` + 删文件（本轮就把板上 `/tmp` 撑到 2.1G）。
+
+## 6. 采集侧性能实测（1280x720 NV12）
+
+| 场景 | 数字 |
+|---|---|
+| 纯采集（`k1cam -n 0` 只读不算） | ~15.4 fps（web `cam.fps` 72s 稳定） |
+| 采集 + python 侧逐帧 numpy 统计（`cam-start.sh`） | 13.2~13.7 fps |
+| 1920x1080（早期实测，同一采集器） | 11.8 fps |
+| web 出流（1280x720 JPEG q80，`fps_out=15`） | 约 6 帧/s（3s 抓到 19 个 boundary），瓶颈是 K1 上的 JPEG 编码，不是相机 |
+
+`isp0` 写 30fps 也只出 15fps（见 5 节），这是 sensor/ISP 侧的上限，和软件无关。
